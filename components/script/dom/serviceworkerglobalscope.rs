@@ -264,11 +264,7 @@ impl ServiceWorkerGlobalScope {
         } = scope_things;
 
         let serialized_worker_url = script_url.to_string();
-        let origin = GlobalScope::current()
-            .expect("No current global object")
-            .origin()
-            .immutable()
-            .clone();
+        let origin = scope_url.origin();
         thread::Builder::new()
             .name(format!("ServiceWorker for {}", serialized_worker_url))
             .spawn(move || {
@@ -386,14 +382,7 @@ impl ServiceWorkerGlobalScope {
     }
 
     fn has_timed_out(&self) -> bool {
-        // Note: this should be included in the `select` inside `run_worker_event_loop`,
-        // otherwise a block on the select can prevent the timeout.
-        if self.time_out_port.try_recv().is_ok() {
-            let _ = self
-                .swmanager_sender
-                .send(ServiceWorkerMsg::Timeout(self.scope_url.clone()));
-            return true;
-        }
+        // TODO: https://w3c.github.io/ServiceWorker/#service-worker-lifetime
         false
     }
 
