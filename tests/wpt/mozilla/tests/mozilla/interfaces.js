@@ -5,12 +5,13 @@ function test_interfaces(interfaceNamesInGlobalScope) {
     var ecmaGlobals = [
       "Array",
       "ArrayBuffer",
-      "Atomics",
       "BigInt",
       "BigInt64Array",
       "BigUint64Array",
       "Boolean",
       "BroadcastChannel",
+      "ByteLengthQueuingStrategy",
+      "CountQueuingStrategy",
       "Crypto",
       "DataView",
       "Date",
@@ -36,11 +37,11 @@ function test_interfaces(interfaceNamesInGlobalScope) {
       "Promise",
       "Proxy",
       "RangeError",
+      "ReadableStream",
       "ReferenceError",
       "Reflect",
       "RegExp",
       "Set",
-      "SharedArrayBuffer",
       "String",
       "Symbol",
       "SyntaxError",
@@ -59,7 +60,7 @@ function test_interfaces(interfaceNamesInGlobalScope) {
     var sources = [
       ecmaGlobals,
       interfaceNamesInGlobalScope,
-      ["AssertionError", "EventWatcher", "PreconditionFailedError"],
+      ["AssertionError", "EventWatcher", "OptionalFeatureUnsupportedError"],
     ];
 
     var interfaceMap = {};

@@ -2,6 +2,7 @@ DOMContentLoaded
 abort
 activate
 addtrack
+animationcancel
 animationend
 animationiteration
 animationstart
@@ -15,6 +16,7 @@ characteristicvaluechanged
 checkbox
 click
 close
+closing
 color
 complete
 compositionend
@@ -22,6 +24,7 @@ compositionstart
 compositionupdate
 controllerchange
 cursive
+datachannel
 date
 datetime-local
 dir
@@ -112,6 +115,7 @@ selectend
 selectionchange
 selectstart
 serif
+sessionavailable
 signalingstatechange
 squeeze
 squeezeend
@@ -132,6 +136,8 @@ track
 transitioncancel
 transitionend
 transitionrun
+transitionstart
+uncapturederror
 unhandledrejection
 unload
 url

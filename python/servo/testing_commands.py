@@ -82,6 +82,8 @@ def create_parser_wpt():
                         help="Servo's JSON logger of unexpected results")
     parser.add_argument('--always-succeed', default=False, action="store_true",
                         help="Always yield exit code of zero")
+    parser.add_argument('--no-default-test-types', default=False, action="store_true",
+                        help="Run all of the test types provided by wptrunner or specified explicitly by --test-types"),
     return parser
 
 
@@ -115,8 +117,8 @@ class MachCommands(CommandBase):
                      help="Optionally select test based on "
                           "test file directory")
     @CommandArgument('--render-mode', '-rm', default=DEFAULT_RENDER_MODE,
-                     help="The render mode to be used on all tests. " +
-                          HELP_RENDER_MODE)
+                     help="The render mode to be used on all tests. "
+                          + HELP_RENDER_MODE)
     @CommandArgument('--release', default=False, action="store_true",
                      help="Run with a release build of servo")
     @CommandArgument('--tidy-all', default=False, action="store_true",
@@ -220,7 +222,7 @@ class MachCommands(CommandBase):
     @CommandArgument('--nocapture', default=False, action="store_true",
                      help="Run tests with nocapture ( show test stdout )")
     @CommandBase.build_like_command_arguments
-    def test_unit(self, test_name=None, package=None, bench=False, nocapture=False, **kwargs):
+    def test_unit(self, test_name=None, package=None, bench=False, nocapture=False, with_layout_2020=False, **kwargs):
         if test_name is None:
             test_name = []
 
@@ -253,7 +255,6 @@ class MachCommands(CommandBase):
         self_contained_tests = [
             "background_hang_monitor",
             "gfx",
-            "layout_2013",
             "msg",
             "net",
             "net_traits",
@@ -261,6 +262,10 @@ class MachCommands(CommandBase):
             "servo_config",
             "servo_remutex",
         ]
+        if with_layout_2020:
+            self_contained_tests.append("layout_2020")
+        else:
+            self_contained_tests.append("layout_2013")
         if not packages:
             packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set(['.DS_Store'])
             packages |= set(self_contained_tests)
@@ -296,7 +301,11 @@ class MachCommands(CommandBase):
             if nocapture:
                 args += ["--", "--nocapture"]
 
-            err = self.run_cargo_build_like_command("bench" if bench else "test", args, env=env, **kwargs)
+            err = self.run_cargo_build_like_command("bench" if bench else "test",
+                                                    args,
+                                                    env=env,
+                                                    with_layout_2020=with_layout_2020,
+                                                    **kwargs)
             if err:
                 return err
 
@@ -463,6 +472,14 @@ class MachCommands(CommandBase):
                 binary_args.append("--pref=" + pref)
             kwargs["binary_args"] = binary_args
 
+        if not kwargs.get('no_default_test_types'):
+            test_types = {
+                "servo": ["testharness", "reftest", "wdspec"],
+                "servodriver": ["testharness", "reftest"],
+            }
+            product = kwargs.get("product") or "servo"
+            kwargs["test_types"] = test_types[product]
+
         run_globals = {"__file__": run_file}
         exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
         return run_globals["run_tests"](**kwargs)
@@ -535,6 +552,8 @@ class MachCommands(CommandBase):
                 elif tracker_api.endswith('/'):
                     tracker_api = tracker_api[0:-1]
 
+                if 'test' not in failure:
+                    continue
                 query = urllib.parse.quote(failure['test'], safe='')
                 request = urllib.request.Request("%s/query.py?name=%s" % (tracker_api, query))
                 search = urllib.request.urlopen(request)
@@ -552,9 +571,17 @@ class MachCommands(CommandBase):
                 is_intermittent = data['total_count'] > 0
 
             if is_intermittent:
-                intermittents.append(failure["output"])
+                if 'output' in failure:
+                    intermittents.append(failure["output"])
+                else:
+                    intermittents.append("%s [expected %s] %s \n"
+                                         % (failure["status"], failure["expected"], failure['test']))
             else:
-                actual_failures.append(failure["output"])
+                if 'output' in failure:
+                    actual_failures.append(failure["output"])
+                else:
+                    actual_failures.append("%s [expected %s] %s \n"
+                                           % (failure["status"], failure["expected"], failure['test']))
 
         def format(outputs, description, file=sys.stdout):
             formatted = "%s %s:\n%s" % (len(outputs), description, "\n".join(outputs))

@@ -47,6 +47,8 @@ extern crate servo_atoms;
 #[macro_use]
 extern crate style;
 
+mod animation_timeline;
+mod animations;
 #[warn(deprecated)]
 #[macro_use]
 mod task;
@@ -89,8 +91,6 @@ pub mod script_runtime;
 pub mod script_thread;
 #[warn(deprecated)]
 pub mod serviceworker_manager;
-#[warn(deprecated)]
-mod serviceworkerjob;
 #[warn(deprecated)]
 mod stylesheet_loader;
 #[warn(deprecated)]

@@ -2,18 +2,31 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::canvas_paint_thread::AntialiasMode;
+use crate::canvas_paint_thread::{AntialiasMode, ImageUpdate, WebrenderApi};
 use crate::raqote_backend::Repetition;
 use canvas_traits::canvas::*;
 use cssparser::RGBA;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D, Vector2D};
+use euclid::{point2, vec2};
+use font_kit::family_name::FamilyName;
+use font_kit::font::Font;
+use font_kit::metrics::Metrics;
+use font_kit::properties::{Properties, Stretch, Style, Weight};
+use font_kit::source::SystemSource;
+use gfx::font::FontHandleMethods;
+use gfx::font_cache_thread::FontCacheThread;
+use gfx::font_context::FontContext;
 use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
 use num_traits::ToPrimitive;
+use servo_arc::Arc as ServoArc;
+use std::cell::RefCell;
 #[allow(unused_imports)]
 use std::marker::PhantomData;
 use std::mem;
-use std::sync::Arc;
-use webrender::api::DirtyRect;
+use std::sync::{Arc, Mutex};
+use style::properties::style_structs::Font as FontStyleStruct;
+use style::values::computed::font;
+use style_traits::values::ToCss;
 use webrender_api::units::RectExt as RectExt_;
 
 /// The canvas data stores a state machine for the current status of
@@ -265,6 +278,15 @@ pub trait GenericDrawTarget {
         operator: CompositionOp,
     );
     fn fill(&mut self, path: &Path, pattern: Pattern, draw_options: &DrawOptions);
+    fn fill_text(
+        &mut self,
+        font: &Font,
+        point_size: f32,
+        text: &str,
+        start: Point2D<f32>,
+        pattern: &Pattern,
+        draw_options: &DrawOptions,
+    );
     fn fill_rect(&mut self, rect: &Rect<f32>, pattern: Pattern, draw_options: Option<&DrawOptions>);
     fn get_format(&self) -> SurfaceFormat;
     fn get_size(&self) -> Size2D<i32>;
@@ -361,19 +383,34 @@ pub enum Filter {
     Point,
 }
 
+pub(crate) type CanvasFontContext = FontContext<FontCacheThread>;
+
+thread_local!(static FONT_CONTEXT: RefCell<Option<CanvasFontContext>> = RefCell::new(None));
+
+pub(crate) fn with_thread_local_font_context<F, R>(canvas_data: &CanvasData, f: F) -> R
+where
+    F: FnOnce(&mut CanvasFontContext) -> R,
+{
+    FONT_CONTEXT.with(|font_context| {
+        f(font_context.borrow_mut().get_or_insert_with(|| {
+            FontContext::new(canvas_data.font_cache_thread.lock().unwrap().clone())
+        }))
+    })
+}
+
 pub struct CanvasData<'a> {
     backend: Box<dyn Backend>,
     drawtarget: Box<dyn GenericDrawTarget>,
     path_state: Option<PathState>,
     state: CanvasPaintState<'a>,
     saved_states: Vec<CanvasPaintState<'a>>,
-    webrender_api: webrender_api::RenderApi,
+    webrender_api: Box<dyn WebrenderApi>,
     image_key: Option<webrender_api::ImageKey>,
     /// An old webrender image key that can be deleted when the next epoch ends.
     old_image_key: Option<webrender_api::ImageKey>,
     /// An old webrender image key that can be deleted when the current epoch ends.
     very_old_image_key: Option<webrender_api::ImageKey>,
-    pub canvas_id: CanvasId,
+    font_cache_thread: Mutex<FontCacheThread>,
 }
 
 fn create_backend() -> Box<dyn Backend> {
@@ -383,24 +420,23 @@ fn create_backend() -> Box<dyn Backend> {
 impl<'a> CanvasData<'a> {
     pub fn new(
         size: Size2D<u64>,
-        webrender_api_sender: webrender_api::RenderApiSender,
+        webrender_api: Box<dyn WebrenderApi>,
         antialias: AntialiasMode,
-        canvas_id: CanvasId,
+        font_cache_thread: FontCacheThread,
     ) -> CanvasData<'a> {
         let backend = create_backend();
         let draw_target = backend.create_drawtarget(size);
-        let webrender_api = webrender_api_sender.create_api();
         CanvasData {
             backend,
             drawtarget: draw_target,
             path_state: None,
             state: CanvasPaintState::new(antialias),
             saved_states: vec![],
-            webrender_api: webrender_api,
+            webrender_api,
             image_key: None,
             old_image_key: None,
             very_old_image_key: None,
-            canvas_id: canvas_id,
+            font_cache_thread: Mutex::new(font_cache_thread),
         }
     }
 
@@ -452,17 +488,122 @@ impl<'a> CanvasData<'a> {
 
     pub fn restore_context_state(&mut self) {
         if let Some(state) = self.saved_states.pop() {
-            mem::replace(&mut self.state, state);
+            let _ = mem::replace(&mut self.state, state);
             self.drawtarget.set_transform(&self.state.transform);
             self.drawtarget.pop_clip();
         }
     }
 
-    pub fn fill_text(&self, text: String, x: f64, y: f64, max_width: Option<f64>) {
-        error!(
-            "Unimplemented canvas2d.fillText. Values received: {}, {}, {}, {:?}.",
-            text, x, y, max_width
+    // https://html.spec.whatwg.org/multipage/#text-preparation-algorithm
+    pub fn fill_text(
+        &mut self,
+        text: String,
+        x: f64,
+        y: f64,
+        max_width: Option<f64>,
+        is_rtl: bool,
+    ) {
+        // Step 2.
+        let text = replace_ascii_whitespace(text);
+
+        // Step 3.
+        let point_size = self
+            .state
+            .font_style
+            .as_ref()
+            .map_or(10., |style| style.font_size.size().px());
+        let font_style = self.state.font_style.as_ref();
+        let font = font_style.map_or_else(
+            || load_system_font_from_style(None),
+            |style| {
+                with_thread_local_font_context(&self, |font_context| {
+                    let font_group = font_context.font_group(ServoArc::new(style.clone()));
+                    let font = font_group
+                        .borrow_mut()
+                        .first(font_context)
+                        .expect("couldn't find font");
+                    let font = font.borrow_mut();
+                    let template = font.handle.template();
+                    Font::from_bytes(Arc::new(template.bytes()), 0)
+                        .ok()
+                        .or_else(|| load_system_font_from_style(Some(style)))
+                })
+            },
         );
+        let font = match font {
+            Some(f) => f,
+            None => {
+                error!("Couldn't load desired font or system fallback.");
+                return;
+            },
+        };
+        let font_width = font_width(&text, point_size, &font);
+
+        // Step 6.
+        let max_width = max_width.map(|width| width as f32);
+        let (width, scale_factor) = match max_width {
+            Some(max_width) if max_width > font_width => (max_width, 1.),
+            Some(max_width) => (font_width, max_width / font_width),
+            None => (font_width, 1.),
+        };
+
+        // Step 7.
+        let start = self.text_origin(x as f32, y as f32, &font.metrics(), width, is_rtl);
+
+        // TODO: Bidi text layout
+
+        let old_transform = self.get_transform();
+        self.set_transform(
+            &old_transform
+                .pre_translate(vec2(start.x, 0.))
+                .pre_scale(scale_factor, 1.)
+                .pre_translate(vec2(-start.x, 0.)),
+        );
+
+        // Step 8.
+        self.drawtarget.fill_text(
+            &font,
+            point_size,
+            &text,
+            start,
+            &self.state.fill_style,
+            &self.state.draw_options,
+        );
+
+        self.set_transform(&old_transform);
+    }
+
+    fn text_origin(
+        &self,
+        x: f32,
+        y: f32,
+        metrics: &Metrics,
+        width: f32,
+        is_rtl: bool,
+    ) -> Point2D<f32> {
+        let text_align = match self.state.text_align {
+            TextAlign::Start if is_rtl => TextAlign::Right,
+            TextAlign::Start => TextAlign::Left,
+            TextAlign::End if is_rtl => TextAlign::Left,
+            TextAlign::End => TextAlign::Right,
+            text_align => text_align,
+        };
+        let anchor_x = match text_align {
+            TextAlign::Center => -width / 2.,
+            TextAlign::Right => -width,
+            _ => 0.,
+        };
+
+        let anchor_y = match self.state.text_baseline {
+            TextBaseline::Top => metrics.ascent,
+            TextBaseline::Hanging => metrics.ascent * HANGING_BASELINE_DEFAULT,
+            TextBaseline::Ideographic => -metrics.descent * IDEOGRAPHIC_BASELINE_DEFAULT,
+            TextBaseline::Middle => (metrics.ascent - metrics.descent) / 2.,
+            TextBaseline::Alphabetic => 0.,
+            TextBaseline::Bottom => -metrics.descent,
+        };
+
+        point2(x + anchor_x, y + anchor_y)
     }
 
     pub fn fill_rect(&mut self, rect: &Rect<f32>) {
@@ -976,27 +1117,31 @@ impl<'a> CanvasData<'a> {
         let data = self.drawtarget.snapshot_data_owned();
         let data = webrender_api::ImageData::Raw(Arc::new(data));
 
-        let mut txn = webrender_api::Transaction::new();
+        let mut updates = vec![];
 
         match self.image_key {
             Some(image_key) => {
                 debug!("Updating image {:?}.", image_key);
-                txn.update_image(image_key, descriptor, data, &DirtyRect::All);
+                updates.push(ImageUpdate::Update(image_key, descriptor, data));
             },
             None => {
-                self.image_key = Some(self.webrender_api.generate_image_key());
+                let key = match self.webrender_api.generate_key() {
+                    Ok(key) => key,
+                    Err(()) => return,
+                };
+                updates.push(ImageUpdate::Add(key, descriptor, data));
+                self.image_key = Some(key);
                 debug!("New image {:?}.", self.image_key);
-                txn.add_image(self.image_key.unwrap(), descriptor, data, None);
             },
         }
 
         if let Some(image_key) =
             mem::replace(&mut self.very_old_image_key, self.old_image_key.take())
         {
-            txn.delete_image(image_key);
+            updates.push(ImageUpdate::Delete(image_key));
         }
 
-        self.webrender_api.update_resources(txn.resource_updates);
+        self.webrender_api.update_images(updates);
 
         let data = CanvasImageData {
             image_key: self.image_key.unwrap(),
@@ -1038,6 +1183,18 @@ impl<'a> CanvasData<'a> {
 
     pub fn set_shadow_color(&mut self, value: RGBA) {
         self.backend.set_shadow_color(value, &mut self.state);
+    }
+
+    pub fn set_font(&mut self, font_style: FontStyleStruct) {
+        self.state.font_style = Some(font_style)
+    }
+
+    pub fn set_text_align(&mut self, text_align: TextAlign) {
+        self.state.text_align = text_align;
+    }
+
+    pub fn set_text_baseline(&mut self, text_baseline: TextBaseline) {
+        self.state.text_baseline = text_baseline;
     }
 
     // https://html.spec.whatwg.org/multipage/#when-shadows-are-drawn
@@ -1107,18 +1264,20 @@ impl<'a> CanvasData<'a> {
 
 impl<'a> Drop for CanvasData<'a> {
     fn drop(&mut self) {
-        let mut txn = webrender_api::Transaction::new();
-
+        let mut updates = vec![];
         if let Some(image_key) = self.old_image_key.take() {
-            txn.delete_image(image_key);
+            updates.push(ImageUpdate::Delete(image_key));
         }
         if let Some(image_key) = self.very_old_image_key.take() {
-            txn.delete_image(image_key);
+            updates.push(ImageUpdate::Delete(image_key));
         }
 
-        self.webrender_api.update_resources(txn.resource_updates);
+        self.webrender_api.update_images(updates);
     }
 }
+
+const HANGING_BASELINE_DEFAULT: f32 = 0.8;
+const IDEOGRAPHIC_BASELINE_DEFAULT: f32 = 0.5;
 
 #[derive(Clone)]
 pub struct CanvasPaintState<'a> {
@@ -1132,6 +1291,9 @@ pub struct CanvasPaintState<'a> {
     pub shadow_offset_y: f64,
     pub shadow_blur: f64,
     pub shadow_color: Color,
+    pub font_style: Option<FontStyleStruct>,
+    pub text_align: TextAlign,
+    pub text_baseline: TextBaseline,
 }
 
 /// It writes an image to the destination target
@@ -1212,4 +1374,91 @@ impl RectExt for Rect<u32> {
     fn to_u64(&self) -> Rect<u64> {
         self.cast()
     }
+}
+
+fn to_font_kit_family(font_family: &font::SingleFontFamily) -> FamilyName {
+    match font_family {
+        font::SingleFontFamily::FamilyName(family_name) => {
+            FamilyName::Title(family_name.to_css_string())
+        },
+        font::SingleFontFamily::Generic(generic) => match generic {
+            font::GenericFontFamily::Serif => FamilyName::Serif,
+            font::GenericFontFamily::SansSerif => FamilyName::SansSerif,
+            font::GenericFontFamily::Monospace => FamilyName::Monospace,
+            font::GenericFontFamily::Fantasy => FamilyName::Fantasy,
+            font::GenericFontFamily::Cursive => FamilyName::Cursive,
+            font::GenericFontFamily::None => unreachable!("Shouldn't appear in computed values"),
+        },
+    }
+}
+
+fn load_system_font_from_style(font_style: Option<&FontStyleStruct>) -> Option<Font> {
+    let mut properties = Properties::new();
+    let style = match font_style {
+        Some(style) => style,
+        None => return load_default_system_fallback_font(&properties),
+    };
+    let family_names = style
+        .font_family
+        .families
+        .iter()
+        .map(to_font_kit_family)
+        .collect::<Vec<_>>();
+    let properties = properties
+        .style(match style.font_style {
+            font::FontStyle::Normal => Style::Normal,
+            font::FontStyle::Italic => Style::Italic,
+            font::FontStyle::Oblique(..) => {
+                // TODO: support oblique angle.
+                Style::Oblique
+            },
+        })
+        .weight(Weight(style.font_weight.0))
+        .stretch(Stretch(style.font_stretch.value()));
+    let font_handle = match SystemSource::new().select_best_match(&family_names, &properties) {
+        Ok(handle) => handle,
+        Err(e) => {
+            error!("error getting font handle for style {:?}: {}", style, e);
+            return load_default_system_fallback_font(&properties);
+        },
+    };
+    match font_handle.load() {
+        Ok(f) => Some(f),
+        Err(e) => {
+            error!("error loading font for style {:?}: {}", style, e);
+            load_default_system_fallback_font(&properties)
+        },
+    }
+}
+
+fn load_default_system_fallback_font(properties: &Properties) -> Option<Font> {
+    SystemSource::new()
+        .select_best_match(&[FamilyName::SansSerif], properties)
+        .ok()?
+        .load()
+        .ok()
+}
+
+fn replace_ascii_whitespace(text: String) -> String {
+    text.chars()
+        .map(|c| match c {
+            ' ' | '\t' | '\n' | '\r' | '\x0C' => '\x20',
+            _ => c,
+        })
+        .collect()
+}
+
+// TODO: This currently calculates the width using just advances and doesn't
+// determine the fallback font in case a character glyph isn't found.
+fn font_width(text: &str, point_size: f32, font: &Font) -> f32 {
+    let metrics = font.metrics();
+    let mut width = 0.;
+    for c in text.chars() {
+        if let Some(glyph_id) = font.glyph_for_char(c) {
+            if let Ok(advance) = font.advance(glyph_id) {
+                width += advance.x() * point_size / metrics.units_per_em as f32;
+            }
+        }
+    }
+    width
 }

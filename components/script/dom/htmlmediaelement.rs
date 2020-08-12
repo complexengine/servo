@@ -77,11 +77,11 @@ use ipc_channel::router::ROUTER;
 use media::{glplayer_channel, GLPlayerMsg, GLPlayerMsgForward, WindowGLContext};
 use net_traits::image::base::Image;
 use net_traits::image_cache::ImageResponse;
-use net_traits::request::{Destination, Referrer};
+use net_traits::request::Destination;
 use net_traits::{CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, Metadata};
 use net_traits::{NetworkError, ResourceFetchTiming, ResourceTimingType};
 use script_layout_interface::HTMLMediaData;
-use script_traits::WebrenderIpcSender;
+use script_traits::{ImageUpdate, WebrenderIpcSender};
 use servo_config::pref;
 use servo_media::player::audio::AudioRenderer;
 use servo_media::player::video::{VideoFrame, VideoFrameRenderer};
@@ -95,9 +95,9 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use time::{self, Duration, Timespec};
+use webrender_api::ImageKey;
 use webrender_api::{ExternalImageData, ExternalImageId, ExternalImageType, TextureTarget};
 use webrender_api::{ImageData, ImageDescriptor, ImageDescriptorFlags, ImageFormat};
-use webrender_api::{ImageKey, Transaction};
 
 #[derive(PartialEq)]
 enum FrameStatus {
@@ -177,10 +177,10 @@ impl MediaFrameRenderer {
 
 impl VideoFrameRenderer for MediaFrameRenderer {
     fn render(&mut self, frame: VideoFrame) {
-        let mut txn = Transaction::new();
+        let mut updates = vec![];
 
         if let Some(old_image_key) = mem::replace(&mut self.very_old_frame, self.old_frame.take()) {
-            txn.delete_image(old_image_key);
+            updates.push(ImageUpdate::DeleteImage(old_image_key));
         }
 
         let descriptor = ImageDescriptor::new(
@@ -195,12 +195,11 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 if *width == frame.get_width() && *height == frame.get_height() =>
             {
                 if !frame.is_gl_texture() {
-                    txn.update_image(
+                    updates.push(ImageUpdate::UpdateImage(
                         *image_key,
                         descriptor,
                         ImageData::Raw(frame.get_data()),
-                        &webrender_api::DirtyRect::All,
-                    );
+                    ));
                 }
 
                 self.current_frame_holder
@@ -208,13 +207,16 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     .set(frame);
 
                 if let Some(old_image_key) = self.old_frame.take() {
-                    txn.delete_image(old_image_key);
+                    updates.push(ImageUpdate::DeleteImage(old_image_key));
                 }
             }
             Some((ref mut image_key, ref mut width, ref mut height)) => {
                 self.old_frame = Some(*image_key);
 
-                let new_image_key = self.api.generate_image_key();
+                let new_image_key = match self.api.generate_image_key() {
+                    Ok(key) => key,
+                    Err(()) => return,
+                };
 
                 /* update current_frame */
                 *image_key = new_image_key;
@@ -241,10 +243,13 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     .get_or_insert_with(|| FrameHolder::new(frame.clone()))
                     .set(frame);
 
-                txn.add_image(new_image_key, descriptor, image_data, None);
+                updates.push(ImageUpdate::AddImage(new_image_key, descriptor, image_data));
             },
             None => {
-                let image_key = self.api.generate_image_key();
+                let image_key = match self.api.generate_image_key() {
+                    Ok(key) => key,
+                    Err(()) => return,
+                };
                 self.current_frame = Some((image_key, frame.get_width(), frame.get_height()));
 
                 let image_data = if frame.is_gl_texture() && self.player_id.is_some() {
@@ -265,10 +270,10 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
                 self.current_frame_holder = Some(FrameHolder::new(frame));
 
-                txn.add_image(image_key, descriptor, image_data, None);
+                updates.push(ImageUpdate::AddImage(image_key, descriptor, image_data));
             },
         }
-        self.api.update_resources(txn.resource_updates);
+        self.api.update_images(updates);
     }
 }
 
@@ -841,12 +846,17 @@ impl HTMLMediaElement {
         };
 
         let cors_setting = cors_setting_for_element(self.upcast());
-        let request = create_a_potential_cors_request(url.clone(), destination, cors_setting, None)
-            .headers(headers)
-            .origin(document.origin().immutable().clone())
-            .pipeline_id(Some(self.global().pipeline_id()))
-            .referrer(Some(Referrer::ReferrerUrl(document.url())))
-            .referrer_policy(document.get_referrer_policy());
+        let request = create_a_potential_cors_request(
+            url.clone(),
+            destination,
+            cors_setting,
+            None,
+            self.global().get_referrer(),
+        )
+        .headers(headers)
+        .origin(document.origin().immutable().clone())
+        .pipeline_id(Some(self.global().pipeline_id()))
+        .referrer_policy(document.get_referrer_policy());
 
         let mut current_fetch_context = self.current_fetch_context.borrow_mut();
         if let Some(ref mut current_fetch_context) = *current_fetch_context {

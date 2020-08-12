@@ -5,6 +5,8 @@
 #![deny(unsafe_code)]
 
 #[macro_use]
+extern crate log;
+#[macro_use]
 extern crate serde;
 
 mod cell;
@@ -13,12 +15,14 @@ pub mod data;
 pub mod display_list;
 mod dom_traversal;
 pub mod element_data;
-mod flow;
+mod flexbox;
+pub mod flow;
 mod formatting_contexts;
 mod fragments;
-mod geom;
+pub mod geom;
 #[macro_use]
 pub mod layout_debug;
+mod lists;
 mod opaque_node;
 mod positioned;
 pub mod query;
@@ -28,13 +32,13 @@ mod style_ext;
 pub mod traversal;
 pub mod wrapper;
 
-pub use flow::{BoxTreeRoot, FragmentTreeRoot};
+pub use flow::{BoxTree, FragmentTree};
 
 use crate::geom::flow_relative::Vec2;
 use style::properties::ComputedValues;
 use style::values::computed::{Length, LengthOrAuto};
 
-struct ContainingBlock<'a> {
+pub struct ContainingBlock<'a> {
     inline_size: Length,
     block_size: LengthOrAuto,
     style: &'a ComputedValues,

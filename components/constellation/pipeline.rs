@@ -21,7 +21,9 @@ use layout_traits::LayoutThreadFactory;
 use media::WindowGLContext;
 use metrics::PaintTimeMetrics;
 use msg::constellation_msg::TopLevelBrowsingContextId;
-use msg::constellation_msg::{BackgroundHangMonitorRegister, HangMonitorAlert, SamplerControlMsg};
+use msg::constellation_msg::{
+    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
+};
 use msg::constellation_msg::{BrowsingContextId, HistoryStateId};
 use msg::constellation_msg::{
     PipelineId, PipelineNamespace, PipelineNamespaceId, PipelineNamespaceRequest,
@@ -95,6 +97,9 @@ pub struct Pipeline {
 
     /// Has this pipeline received a notification that it is completely loaded?
     pub completely_loaded: bool,
+
+    /// The title of this pipeline's document.
+    pub title: String,
 }
 
 /// Initial setup data needed to construct a pipeline.
@@ -128,7 +133,7 @@ pub struct InitialPipelineState {
     pub background_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
 
     /// A channel for the background hang monitor to send messages to the constellation.
-    pub background_hang_monitor_to_constellation_chan: Option<IpcSender<HangMonitorAlert>>,
+    pub background_hang_monitor_to_constellation_chan: IpcSender<HangMonitorAlert>,
 
     /// A channel for the layout thread to send messages to the constellation.
     pub layout_to_constellation_chan: IpcSender<LayoutMsg>,
@@ -205,7 +210,7 @@ pub struct InitialPipelineState {
 
 pub struct NewPipeline {
     pub pipeline: Pipeline,
-    pub sampler_control_chan: Option<IpcSender<SamplerControlMsg>>,
+    pub bhm_control_chan: Option<IpcSender<BackgroundHangMonitorControlMsg>>,
 }
 
 impl Pipeline {
@@ -220,7 +225,7 @@ impl Pipeline {
         // probably requires a general low-memory strategy.
         let (pipeline_chan, pipeline_port) = ipc::channel().expect("Pipeline main chan");
 
-        let (script_chan, sampler_chan) = match state.event_loop {
+        let (script_chan, bhm_control_chan) = match state.event_loop {
             Some(script_chan) => {
                 let new_layout_info = NewLayoutInfo {
                     parent_info: state.parent_pipeline_id,
@@ -279,7 +284,7 @@ impl Pipeline {
                     background_hang_monitor_to_constellation_chan: state
                         .background_hang_monitor_to_constellation_chan
                         .clone(),
-                    sampling_profiler_port: None,
+                    bhm_control_port: None,
                     scheduler_chan: state.scheduler_chan,
                     devtools_chan: script_to_devtools_chan,
                     bluetooth_thread: state.bluetooth_thread,
@@ -309,34 +314,26 @@ impl Pipeline {
                 // Spawn the child process.
                 //
                 // Yes, that's all there is to it!
-                let sampler_chan = if opts::multiprocess() {
-                    let (sampler_chan, sampler_port) = ipc::channel().expect("Sampler chan");
-                    unprivileged_pipeline_content.sampling_profiler_port = Some(sampler_port);
+                let bhm_control_chan = if opts::multiprocess() {
+                    let (bhm_control_chan, bhm_control_port) =
+                        ipc::channel().expect("Sampler chan");
+                    unprivileged_pipeline_content.bhm_control_port = Some(bhm_control_port);
                     let _ = unprivileged_pipeline_content.spawn_multiprocess()?;
-                    Some(sampler_chan)
+                    Some(bhm_control_chan)
                 } else {
                     // Should not be None in single-process mode.
-                    if opts::get().background_hang_monitor {
-                        let register = state.background_monitor_register.expect(
-                            "Couldn't start content, no background monitor has been initiated",
-                        );
-                        unprivileged_pipeline_content.start_all::<Message, LTF, STF>(
-                            false,
-                            Some(register),
-                            state.event_loop_waker,
-                        );
-                        None
-                    } else {
-                        unprivileged_pipeline_content.start_all::<Message, LTF, STF>(
-                            false,
-                            None,
-                            state.event_loop_waker,
-                        );
-                        None
-                    }
+                    let register = state
+                        .background_monitor_register
+                        .expect("Couldn't start content, no background monitor has been initiated");
+                    unprivileged_pipeline_content.start_all::<Message, LTF, STF>(
+                        false,
+                        register,
+                        state.event_loop_waker,
+                    );
+                    None
                 };
 
-                (EventLoop::new(script_chan), sampler_chan)
+                (EventLoop::new(script_chan), bhm_control_chan)
             },
         };
 
@@ -353,7 +350,7 @@ impl Pipeline {
         );
         Ok(NewPipeline {
             pipeline,
-            sampler_control_chan: sampler_chan,
+            bhm_control_chan,
         })
     }
 
@@ -385,6 +382,7 @@ impl Pipeline {
             history_state_id: None,
             history_states: HashSet::new(),
             completely_loaded: false,
+            title: String::new(),
         };
 
         pipeline.notify_visibility(is_visible);
@@ -494,8 +492,8 @@ pub struct UnprivilegedPipelineContent {
     opener: Option<BrowsingContextId>,
     namespace_request_sender: IpcSender<PipelineNamespaceRequest>,
     script_to_constellation_chan: ScriptToConstellationChan,
-    background_hang_monitor_to_constellation_chan: Option<IpcSender<HangMonitorAlert>>,
-    sampling_profiler_port: Option<IpcReceiver<SamplerControlMsg>>,
+    background_hang_monitor_to_constellation_chan: IpcSender<HangMonitorAlert>,
+    bhm_control_port: Option<IpcReceiver<BackgroundHangMonitorControlMsg>>,
     layout_to_constellation_chan: IpcSender<LayoutMsg>,
     scheduler_chan: IpcSender<TimerSchedulerMsg>,
     devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
@@ -526,7 +524,7 @@ impl UnprivilegedPipelineContent {
     pub fn start_all<Message, LTF, STF>(
         self,
         wait_for_completion: bool,
-        background_hang_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
+        background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
         event_loop_waker: Option<Box<dyn EventLoopWaker>>,
     ) where
         LTF: LayoutThreadFactory<Message = Message>,
@@ -584,6 +582,7 @@ impl UnprivilegedPipelineContent {
                 self.opts.exit_after_load ||
                 self.opts.webdriver_port.is_some(),
             self.opts.unminify_js,
+            self.opts.local_script_source,
             self.opts.userscripts,
             self.opts.headless,
             self.opts.replace_surrogates,
@@ -605,7 +604,6 @@ impl UnprivilegedPipelineContent {
             self.time_profiler_chan,
             self.mem_profiler_chan,
             self.webrender_api_sender,
-            self.webrender_document,
             paint_time_metrics,
             layout_thread_busy_flag.clone(),
             self.opts.load_webfonts_synchronously,
@@ -634,17 +632,12 @@ impl UnprivilegedPipelineContent {
 
     pub fn register_with_background_hang_monitor(
         &mut self,
-    ) -> Option<Box<dyn BackgroundHangMonitorRegister>> {
-        self.background_hang_monitor_to_constellation_chan
-            .clone()
-            .map(|bhm| {
-                HangMonitorRegister::init(
-                    bhm.clone(),
-                    self.sampling_profiler_port
-                        .take()
-                        .expect("no sampling profiler?"),
-                )
-            })
+    ) -> Box<dyn BackgroundHangMonitorRegister> {
+        HangMonitorRegister::init(
+            self.background_hang_monitor_to_constellation_chan.clone(),
+            self.bhm_control_port.take().expect("no sampling profiler?"),
+            opts::get().background_hang_monitor,
+        )
     }
 
     pub fn script_to_constellation_chan(&self) -> &ScriptToConstellationChan {

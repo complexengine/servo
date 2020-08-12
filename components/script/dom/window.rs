@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::bindings::cell::DomRefCell;
+use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
@@ -40,6 +40,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::history::History;
+use crate::dom::identityhub::Identities;
 use crate::dom::location::Location;
 use crate::dom::mediaquerylist::{MediaQueryList, MediaQueryListMatchState};
 use crate::dom::mediaquerylistevent::MediaQueryListEvent;
@@ -71,6 +72,7 @@ use crate::task_source::{TaskSource, TaskSourceName};
 use crate::timers::{IsInterval, TimerCallback};
 use crate::webdriver_handlers::jsval_to_webdriver;
 use app_units::Au;
+use backtrace::Backtrace;
 use base64;
 use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLChan;
@@ -81,13 +83,14 @@ use dom_struct::dom_struct;
 use embedder_traits::{EmbedderMsg, EventLoopWaker, PromptDefinition, PromptOrigin, PromptResult};
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect};
 use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
-use ipc_channel::ipc::{channel, IpcSender};
+use ipc_channel::ipc::IpcSender;
 use ipc_channel::router::ROUTER;
+use js::conversions::ToJSValConvertible;
 use js::jsapi::Heap;
 use js::jsapi::JSAutoRealm;
 use js::jsapi::JSObject;
 use js::jsapi::JSPROP_ENUMERATE;
-use js::jsapi::{GCReason, JS_GC};
+use js::jsapi::{GCReason, StackFormat, JS_GC};
 use js::jsval::UndefinedValue;
 use js::jsval::{JSVal, NullValue};
 use js::rust::wrappers::JS_DefineProperty;
@@ -99,6 +102,7 @@ use net_traits::image_cache::{PendingImageId, PendingImageResponse};
 use net_traits::storage_thread::StorageType;
 use net_traits::ResourceThreads;
 use num_traits::ToPrimitive;
+use parking_lot::Mutex as ParkMutex;
 use profile_traits::ipc as ProfiledIpc;
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::{ProfilerChan as TimeProfilerChan, ProfilerMsg};
@@ -115,8 +119,9 @@ use script_traits::{
 };
 use script_traits::{TimerSchedulerMsg, WebrenderIpcSender, WindowSizeData, WindowSizeType};
 use selectors::attr::CaseSensitivity;
+use servo_arc::Arc as ServoArc;
 use servo_geometry::{f32_rect_to_au_rect, MaxRect};
-use servo_url::{Host, ImmutableOrigin, MutableOrigin, ServoUrl};
+use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use std::borrow::Cow;
 use std::borrow::ToOwned;
 use std::cell::Cell;
@@ -124,7 +129,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::env;
-use std::fs;
 use std::io::{stderr, stdout, Write};
 use std::mem;
 use std::rc::Rc;
@@ -134,7 +138,8 @@ use style::dom::OpaqueNode;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::media_queries;
 use style::parser::ParserContext as CssParserContext;
-use style::properties::PropertyId;
+use style::properties::style_structs::Font;
+use style::properties::{PropertyId, ShorthandId};
 use style::selector_parser::PseudoElement;
 use style::str::HTML_SPACE_CHARACTERS;
 use style::stylesheets::CssRuleType;
@@ -173,6 +178,7 @@ pub enum ReflowReason {
     IFrameLoadEvent,
     MissingExplicitReflow,
     ElementStateChanged,
+    PendingReflow,
 }
 
 #[dom_struct]
@@ -219,6 +225,9 @@ pub struct Window {
     js_runtime: DomRefCell<Option<Rc<Runtime>>>,
 
     /// A handle for communicating messages to the layout thread.
+    ///
+    /// This channel shouldn't be accessed directly, but through `Window::layout_chan()`,
+    /// which returns `None` if there's no layout thread anymore.
     #[ignore_malloc_size_of = "channels are hard"]
     layout_chan: Sender<Msg>,
 
@@ -283,6 +292,9 @@ pub struct Window {
     /// opt is enabled.
     unminified_js_dir: DomRefCell<Option<String>>,
 
+    /// Directory with stored unminified scripts
+    local_script_source: Option<String>,
+
     /// Worklets
     test_worklet: MutNullableDom<Worklet>,
     /// <https://drafts.css-houdini.org/css-paint-api-1/#paint-worklet>
@@ -339,6 +351,9 @@ pub struct Window {
     /// those values will cause the marker to be set to false.
     #[ignore_malloc_size_of = "Rc is hard"]
     layout_marker: DomRefCell<Rc<Cell<bool>>>,
+
+    /// https://dom.spec.whatwg.org/#window-current-event
+    current_event: DomRefCell<Option<Dom<Event>>>,
 }
 
 impl Window {
@@ -385,7 +400,7 @@ impl Window {
             let flag = ignore_flags
                 .entry(task_source_name)
                 .or_insert(Default::default());
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::SeqCst);
         }
     }
 
@@ -401,6 +416,10 @@ impl Window {
     #[allow(unsafe_code)]
     pub fn get_cx(&self) -> JSContext {
         unsafe { JSContext::from_ptr(self.js_runtime.borrow().as_ref().unwrap().cx()) }
+    }
+
+    pub fn get_js_runtime(&self) -> Ref<Option<Rc<Runtime>>> {
+        self.js_runtime.borrow()
     }
 
     pub fn main_thread_script_chan(&self) -> &Sender<MainThreadScriptMsg> {
@@ -661,7 +680,7 @@ impl WindowMethods for Window {
         url: USVString,
         target: DOMString,
         features: DOMString,
-    ) -> Option<DomRoot<WindowProxy>> {
+    ) -> Fallible<Option<DomRoot<WindowProxy>>> {
         self.window_proxy().open(url, target, features)
     }
 
@@ -1064,6 +1083,20 @@ impl WindowMethods for Window {
     }
 
     #[allow(unsafe_code)]
+    fn Js_backtrace(&self) {
+        unsafe {
+            capture_stack!(in(*self.get_cx()) let stack);
+            let js_stack = stack.and_then(|s| s.as_string(None, StackFormat::SpiderMonkey));
+            let rust_stack = Backtrace::new();
+            println!(
+                "Current JS stack:\n{}\nCurrent Rust stack:\n{:?}",
+                js_stack.unwrap_or(String::new()),
+                rust_stack
+            );
+        }
+    }
+
+    #[allow(unsafe_code)]
     fn WebdriverCallback(&self, cx: JSContext, val: HandleValue) {
         let rv = unsafe { jsval_to_webdriver(*cx, &self.globalscope, val) };
         let opt_chan = self.webdriver_script_chan.borrow_mut().take();
@@ -1304,9 +1337,9 @@ impl WindowMethods for Window {
     }
 
     fn RunningAnimationCount(&self) -> u32 {
-        let (sender, receiver) = channel().unwrap();
-        let _ = self.layout_chan.send(Msg::GetRunningAnimations(sender));
-        receiver.recv().unwrap_or(0) as u32
+        self.document
+            .get()
+            .map_or(0, |d| d.animations().running_animation_count() as u32)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-name
@@ -1333,9 +1366,34 @@ impl WindowMethods for Window {
     fn GetSelection(&self) -> Option<DomRoot<Selection>> {
         self.document.get().and_then(|d| d.GetSelection())
     }
+
+    // https://dom.spec.whatwg.org/#dom-window-event
+    #[allow(unsafe_code)]
+    fn Event(&self, cx: JSContext) -> JSVal {
+        rooted!(in(*cx) let mut rval = UndefinedValue());
+        if let Some(ref event) = *self.current_event.borrow() {
+            unsafe {
+                event
+                    .reflector()
+                    .get_jsobject()
+                    .to_jsval(*cx, rval.handle_mut());
+            }
+        }
+        rval.get()
+    }
 }
 
 impl Window {
+    pub(crate) fn set_current_event(&self, event: Option<&Event>) -> Option<DomRoot<Event>> {
+        let current = self
+            .current_event
+            .borrow()
+            .as_ref()
+            .map(|e| DomRoot::from_ref(&**e));
+        *self.current_event.borrow_mut() = event.map(|e| Dom::from_ref(e));
+        current
+    }
+
     /// https://html.spec.whatwg.org/multipage/#window-post-message-steps
     fn post_message_impl(
         &self,
@@ -1388,7 +1446,7 @@ impl Window {
                 .entry(task_source_name)
                 .or_insert(Default::default());
             let cancelled = mem::replace(&mut *flag, Default::default());
-            cancelled.store(true, Ordering::Relaxed);
+            cancelled.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1401,12 +1459,12 @@ impl Window {
             .entry(task_source_name)
             .or_insert(Default::default());
         let cancelled = mem::replace(&mut *flag, Default::default());
-        cancelled.store(true, Ordering::Relaxed);
+        cancelled.store(true, Ordering::SeqCst);
     }
 
     pub fn clear_js_runtime(&self) {
-        // Remove the infra for managing messageports and broadcast channels.
-        self.upcast::<GlobalScope>().remove_web_messaging_infra();
+        self.upcast::<GlobalScope>()
+            .remove_web_messaging_and_dedicated_workers_infra();
 
         // Clean up any active promises
         // https://github.com/servo/servo/issues/15318
@@ -1513,12 +1571,15 @@ impl Window {
         // TODO Step 1
         // TODO(mrobinson, #18709): Add smooth scrolling support to WebRender so that we can
         // properly process ScrollBehavior here.
-        self.layout_chan
-            .send(Msg::UpdateScrollStateFromScript(ScrollState {
-                scroll_id,
-                scroll_offset: Vector2D::new(-x, -y),
-            }))
-            .unwrap();
+        match self.layout_chan() {
+            Some(chan) => chan
+                .send(Msg::UpdateScrollStateFromScript(ScrollState {
+                    scroll_id,
+                    scroll_offset: Vector2D::new(-x, -y),
+                }))
+                .unwrap(),
+            None => warn!("Layout channel unavailable"),
+        }
     }
 
     pub fn update_viewport_for_scroll(&self, x: f32, y: f32) {
@@ -1544,16 +1605,14 @@ impl Window {
         )
     }
 
-    /// Advances the layout animation clock by `delta` milliseconds, and then
-    /// forces a reflow if `tick` is true.
-    pub fn advance_animation_clock(&self, delta: i32, tick: bool) {
-        self.layout_chan
-            .send(Msg::AdvanceClockMs(
-                delta,
-                tick,
-                self.origin().immutable().clone(),
-            ))
-            .unwrap();
+    /// Prepares to tick animations and then does a reflow which also advances the
+    /// layout animation clock.
+    #[allow(unsafe_code)]
+    pub fn advance_animation_clock(&self, delta_ms: i32) {
+        let pipeline_id = self.upcast::<GlobalScope>().pipeline_id();
+        self.Document()
+            .advance_animation_timeline_for_testing(delta_ms as f64 / 1000.);
+        ScriptThread::handle_tick_all_animations_for_testing(pipeline_id);
     }
 
     /// Reflows the page unconditionally if possible and not suppressed. This
@@ -1626,10 +1685,18 @@ impl Window {
 
         // If this reflow is for display, ensure webgl canvases are composited with
         // up-to-date contents.
-        match reflow_goal {
-            ReflowGoal::Full => document.flush_dirty_canvases(),
-            ReflowGoal::TickAnimations | ReflowGoal::LayoutQuery(..) => {},
+        if for_display {
+            document.flush_dirty_webgpu_canvases();
+            document.flush_dirty_webgl_canvases();
         }
+
+        let pending_restyles = document.drain_pending_restyles();
+
+        let dirty_root = document
+            .take_dirty_root()
+            .filter(|_| !stylesheets_changed)
+            .or_else(|| document.GetDocumentElement())
+            .map(|root| root.upcast::<Node>().to_trusted_node_address());
 
         // Send new document and relevant styles to layout.
         let needs_display = reflow_goal.needs_display();
@@ -1638,18 +1705,24 @@ impl Window {
                 page_clip_rect: self.page_clip_rect.get(),
             },
             document: document.upcast::<Node>().to_trusted_node_address(),
+            dirty_root,
             stylesheets_changed,
             window_size: self.window_size.get(),
             origin: self.origin().immutable().clone(),
             reflow_goal,
             script_join_chan: join_chan,
             dom_count: document.dom_count(),
-            pending_restyles: document.drain_pending_restyles(),
+            pending_restyles,
+            animation_timeline_value: document.current_animation_timeline_value(),
+            animations: document.animations().sets.clone(),
         };
 
-        self.layout_chan
-            .send(Msg::Reflow(reflow))
-            .expect("Layout thread disconnected.");
+        match self.layout_chan() {
+            Some(layout_chan) => layout_chan
+                .send(Msg::Reflow(reflow))
+                .expect("Layout thread disconnected"),
+            None => return false,
+        };
 
         debug!("script: layout forked");
 
@@ -1708,9 +1781,7 @@ impl Window {
             }
         }
 
-        unsafe {
-            ScriptThread::note_newly_animating_nodes(pipeline_id, complete.newly_animating_nodes);
-        }
+        document.update_animations_post_reflow();
 
         true
     }
@@ -1739,12 +1810,17 @@ impl Window {
 
             // We shouldn't need a reflow immediately after a
             // reflow, except if we're waiting for a deferred paint.
-            assert!({
-                let condition = self.Document().needs_reflow();
-                condition.is_none() ||
-                    (!for_display && condition == Some(ReflowTriggerCondition::PaintPostponed)) ||
-                    self.suppress_reflow.get()
-            });
+            let condition = self.Document().needs_reflow();
+            assert!(
+                {
+                    condition.is_none() ||
+                        (!for_display &&
+                            condition == Some(ReflowTriggerCondition::PaintPostponed)) ||
+                        self.suppress_reflow.get()
+                },
+                "condition was {:?}",
+                condition
+            );
         } else {
             debug!(
                 "Document doesn't need reflow - skipping it (reason {:?})",
@@ -1796,6 +1872,18 @@ impl Window {
             ReflowGoal::LayoutQuery(query_msg, time::precise_time_ns()),
             ReflowReason::Query,
         )
+    }
+
+    pub fn resolved_font_style_query(&self, node: &Node, value: String) -> Option<ServoArc<Font>> {
+        let id = PropertyId::Shorthand(ShorthandId::Font);
+        if !self.layout_reflow(QueryMsg::ResolvedFontStyleQuery(
+            node.to_trusted_node_address(),
+            id,
+            value,
+        )) {
+            return None;
+        }
+        self.layout_rpc.resolved_font_style()
     }
 
     pub fn layout(&self) -> &dyn LayoutRPC {
@@ -1930,25 +2018,10 @@ impl Window {
         if !self.unminify_js {
             return;
         }
-        // Create a folder for the document host to store unminified scripts.
-        if let Some(&Host::Domain(ref host)) = document.url().origin().host() {
-            let mut path = env::current_dir().unwrap();
-            path.push("unminified-js");
-            path.push(host);
-            let _ = fs::remove_dir_all(&path);
-            match fs::create_dir_all(&path) {
-                Ok(_) => {
-                    *self.unminified_js_dir.borrow_mut() =
-                        Some(path.into_os_string().into_string().unwrap());
-                    debug!(
-                        "Created folder for {:?} unminified scripts {:?}",
-                        host,
-                        self.unminified_js_dir.borrow()
-                    );
-                },
-                Err(_) => warn!("Could not create unminified dir for {:?}", host),
-            }
-        }
+        // Set a path for the document host to store unminified scripts.
+        let mut path = env::current_dir().unwrap();
+        path.push("unminified-js");
+        *self.unminified_js_dir.borrow_mut() = Some(path.into_os_string().into_string().unwrap());
     }
 
     /// Commence a new URL load which will either replace this window or scroll to a fragment.
@@ -2053,8 +2126,12 @@ impl Window {
         self.Document().url()
     }
 
-    pub fn layout_chan(&self) -> &Sender<Msg> {
-        &self.layout_chan
+    pub fn layout_chan(&self) -> Option<&Sender<Msg>> {
+        if self.is_alive() {
+            Some(&self.layout_chan)
+        } else {
+            None
+        }
     }
 
     pub fn windowproxy_handler(&self) -> WindowProxyHandler {
@@ -2224,6 +2301,10 @@ impl Window {
         self.unminified_js_dir.borrow().clone()
     }
 
+    pub fn local_script_source(&self) -> &Option<String> {
+        &self.local_script_source
+    }
+
     pub fn set_navigation_start(&self) {
         let current_time = time::get_time();
         let now = (current_time.sec * 1000 + current_time.nsec as i64 / 1000000) as u64;
@@ -2287,12 +2368,14 @@ impl Window {
         relayout_event: bool,
         prepare_for_screenshot: bool,
         unminify_js: bool,
+        local_script_source: Option<String>,
         userscripts_path: Option<String>,
         is_headless: bool,
         replace_surrogates: bool,
         user_agent: Cow<'static, str>,
         player_context: WindowGLContext,
         event_loop_waker: Option<Box<dyn EventLoopWaker>>,
+        gpu_id_hub: Arc<ParkMutex<Identities>>,
     ) -> DomRoot<Self> {
         let layout_rpc: Box<dyn LayoutRPC + Send> = {
             let (rpc_send, rpc_recv) = unbounded();
@@ -2316,6 +2399,7 @@ impl Window {
                 microtask_queue,
                 is_headless,
                 user_agent,
+                gpu_id_hub,
             ),
             script_chan,
             task_manager,
@@ -2359,6 +2443,7 @@ impl Window {
             webxr_registry,
             pending_layout_images: Default::default(),
             unminified_js_dir: Default::default(),
+            local_script_source,
             test_worklet: Default::default(),
             paint_worklet: Default::default(),
             webrender_document,
@@ -2375,6 +2460,7 @@ impl Window {
             event_loop_waker,
             visible: Cell::new(true),
             layout_marker: DomRefCell::new(Rc::new(Cell::new(true))),
+            current_event: DomRefCell::new(None),
         });
 
         unsafe { WindowBinding::Wrap(JSContext::from_ptr(runtime.cx()), win) }
@@ -2446,8 +2532,7 @@ fn should_move_clip_rect(clip_rect: UntypedRect<Au>, new_viewport: UntypedRect<f
 }
 
 fn debug_reflow_events(id: PipelineId, reflow_goal: &ReflowGoal, reason: &ReflowReason) {
-    let mut debug_msg = format!("**** pipeline={}", id);
-    debug_msg.push_str(match *reflow_goal {
+    let goal_string = match *reflow_goal {
         ReflowGoal::Full => "\tFull",
         ReflowGoal::TickAnimations => "\tTickAnimations",
         ReflowGoal::LayoutQuery(ref query_msg, _) => match query_msg {
@@ -2458,38 +2543,16 @@ fn debug_reflow_events(id: PipelineId, reflow_goal: &ReflowGoal, reason: &Reflow
             &QueryMsg::NodeScrollGeometryQuery(_n) => "\tNodeScrollGeometryQuery",
             &QueryMsg::NodeScrollIdQuery(_n) => "\tNodeScrollIdQuery",
             &QueryMsg::ResolvedStyleQuery(_, _, _) => "\tResolvedStyleQuery",
+            &QueryMsg::ResolvedFontStyleQuery(..) => "\nResolvedFontStyleQuery",
             &QueryMsg::OffsetParentQuery(_n) => "\tOffsetParentQuery",
             &QueryMsg::StyleQuery => "\tStyleQuery",
             &QueryMsg::TextIndexQuery(..) => "\tTextIndexQuery",
             &QueryMsg::ElementInnerTextQuery(_) => "\tElementInnerTextQuery",
             &QueryMsg::InnerWindowDimensionsQuery(_) => "\tInnerWindowDimensionsQuery",
         },
-    });
+    };
 
-    debug_msg.push_str(match *reason {
-        ReflowReason::CachedPageNeededReflow => "\tCachedPageNeededReflow",
-        ReflowReason::RefreshTick => "\tRefreshTick",
-        ReflowReason::FirstLoad => "\tFirstLoad",
-        ReflowReason::KeyEvent => "\tKeyEvent",
-        ReflowReason::MouseEvent => "\tMouseEvent",
-        ReflowReason::Query => "\tQuery",
-        ReflowReason::Timer => "\tTimer",
-        ReflowReason::Viewport => "\tViewport",
-        ReflowReason::WindowResize => "\tWindowResize",
-        ReflowReason::DOMContentLoaded => "\tDOMContentLoaded",
-        ReflowReason::DocumentLoaded => "\tDocumentLoaded",
-        ReflowReason::StylesheetLoaded => "\tStylesheetLoaded",
-        ReflowReason::ImageLoaded => "\tImageLoaded",
-        ReflowReason::RequestAnimationFrame => "\tRequestAnimationFrame",
-        ReflowReason::WebFontLoaded => "\tWebFontLoaded",
-        ReflowReason::WorkletLoaded => "\tWorkletLoaded",
-        ReflowReason::FramedContentChanged => "\tFramedContentChanged",
-        ReflowReason::IFrameLoadEvent => "\tIFrameLoadEvent",
-        ReflowReason::MissingExplicitReflow => "\tMissingExplicitReflow",
-        ReflowReason::ElementStateChanged => "\tElementStateChanged",
-    });
-
-    println!("{}", debug_msg);
+    println!("**** pipeline={}\t{}\t{:?}", id, goal_string, reason);
 }
 
 impl Window {

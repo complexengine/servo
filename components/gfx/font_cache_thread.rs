@@ -12,8 +12,9 @@ use crate::platform::font_list::system_default_family;
 use crate::platform::font_list::SANS_SERIF_FONT_FAMILY;
 use crate::platform::font_template::FontTemplateData;
 use app_units::Au;
+use gfx_traits::{FontData, WebrenderApi};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
-use net_traits::request::{Destination, RequestBuilder};
+use net_traits::request::{Destination, Referrer, RequestBuilder};
 use net_traits::{fetch_async, CoreResourceThread, FetchResponseMsg};
 use servo_atoms::Atom;
 use servo_url::ServoUrl;
@@ -135,7 +136,7 @@ struct FontCache {
     web_families: HashMap<LowercaseString, FontTemplates>,
     font_context: FontContextHandle,
     core_resource_thread: CoreResourceThread,
-    webrender_api: webrender_api::RenderApi,
+    webrender_api: Box<dyn WebrenderApi>,
     webrender_fonts: HashMap<Atom, webrender_api::FontKey>,
     font_instances: HashMap<(webrender_api::FontKey, Au), webrender_api::FontInstanceKey>,
 }
@@ -186,11 +187,7 @@ impl FontCache {
                             .font_instances
                             .entry((font_key, size))
                             .or_insert_with(|| {
-                                let key = webrender_api.generate_font_instance_key();
-                                let mut txn = webrender_api::Transaction::new();
-                                txn.add_font_instance(key, font_key, size, None, None, Vec::new());
-                                webrender_api.update_resources(txn.resource_updates);
-                                key
+                                webrender_api.add_font_instance(font_key, size.to_f32_px())
                             });
 
                     let _ = result.send(instance_key);
@@ -238,7 +235,10 @@ impl FontCache {
                     None => return,
                 };
 
-                let request = RequestBuilder::new(url.clone()).destination(Destination::Font);
+                // FIXME:
+                // This shouldn't use NoReferrer, but the current documents url
+                let request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+                    .destination(Destination::Font);
 
                 let channel_to_self = self.channel_to_self.clone();
                 let bytes = Mutex::new(Vec::new());
@@ -394,15 +394,12 @@ impl FontCache {
         let font_key = *webrender_fonts
             .entry(template.identifier.clone())
             .or_insert_with(|| {
-                let font_key = webrender_api.generate_font_key();
-                let mut txn = webrender_api::Transaction::new();
-                match (template.bytes_if_in_memory(), template.native_font()) {
-                    (Some(bytes), _) => txn.add_raw_font(font_key, bytes, 0),
-                    (None, Some(native_font)) => txn.add_native_font(font_key, native_font),
-                    (None, None) => txn.add_raw_font(font_key, template.bytes(), 0),
-                }
-                webrender_api.update_resources(txn.resource_updates);
-                font_key
+                let font = match (template.bytes_if_in_memory(), template.native_font()) {
+                    (Some(bytes), _) => FontData::Raw(bytes),
+                    (None, Some(native_font)) => FontData::Native(native_font),
+                    (None, None) => FontData::Raw(template.bytes()),
+                };
+                webrender_api.add_font(font)
             });
 
         FontTemplateInfo {
@@ -441,7 +438,7 @@ pub struct FontCacheThread {
 impl FontCacheThread {
     pub fn new(
         core_resource_thread: CoreResourceThread,
-        webrender_api: webrender_api::RenderApi,
+        webrender_api: Box<dyn WebrenderApi + Send>,
     ) -> FontCacheThread {
         let (chan, port) = ipc::channel().unwrap();
 

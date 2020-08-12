@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
-#![feature(track_caller)]
 
 #[macro_use]
 extern crate log;
@@ -72,6 +71,8 @@ pub enum ConstellationMsg {
     AllowNavigationResponse(PipelineId, bool),
     /// Request to load a page.
     LoadUrl(TopLevelBrowsingContextId, ServoUrl),
+    /// Clear the network cache.
+    ClearCache,
     /// Request to traverse the joint session history of the provided browsing context.
     TraverseHistory(TopLevelBrowsingContextId, TraversalDirection),
     /// Inform the constellation of a window being resized.
@@ -110,6 +111,8 @@ pub enum ConstellationMsg {
     MediaSessionAction(MediaSessionActionType),
     /// Toggle browser visibility.
     ChangeBrowserVisibility(TopLevelBrowsingContextId, bool),
+    /// Virtual keyboard was dismissed
+    IMEDismissed,
 }
 
 impl fmt::Debug for ConstellationMsg {
@@ -141,6 +144,8 @@ impl fmt::Debug for ConstellationMsg {
             ExitFullScreen(..) => "ExitFullScreen",
             MediaSessionAction(..) => "MediaSessionAction",
             ChangeBrowserVisibility(..) => "ChangeBrowserVisibility",
+            IMEDismissed => "IMEDismissed",
+            ClearCache => "ClearCache",
         };
         write!(formatter, "ConstellationMsg::{}", variant)
     }

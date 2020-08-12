@@ -17,8 +17,10 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlcanvaselement::HTMLCanvasElement;
-use crate::dom::webgl_validations::tex_image_2d::{TexStorageValidator, TexStorageValidatorResult};
+use crate::dom::htmlcanvaselement::{HTMLCanvasElement, LayoutCanvasRenderingContextHelpers};
+use crate::dom::webgl_validations::tex_image_2d::{
+    TexImage2DValidator, TexImage2DValidatorResult, TexStorageValidator, TexStorageValidatorResult,
+};
 use crate::dom::webgl_validations::WebGLValidator;
 use crate::dom::webglactiveinfo::WebGLActiveInfo;
 use crate::dom::webglbuffer::WebGLBuffer;
@@ -27,7 +29,7 @@ use crate::dom::webglprogram::WebGLProgram;
 use crate::dom::webglquery::WebGLQuery;
 use crate::dom::webglrenderbuffer::WebGLRenderbuffer;
 use crate::dom::webglrenderingcontext::{
-    uniform_get, uniform_typed, LayoutCanvasWebGLRenderingContextHelpers, Operation, VertexAttrib,
+    uniform_get, uniform_typed, Operation, TexPixels, TexSource, VertexAttrib,
     WebGLRenderingContext,
 };
 use crate::dom::webglsampler::{WebGLSampler, WebGLSamplerValue};
@@ -48,7 +50,7 @@ use canvas_traits::webgl::{
 };
 use dom_struct::dom_struct;
 use euclid::default::{Point2D, Rect, Size2D};
-use ipc_channel::ipc;
+use ipc_channel::ipc::{self, IpcSharedMemory};
 use js::jsapi::{JSObject, Type};
 use js::jsval::{BooleanValue, DoubleValue, Int32Value, UInt32Value};
 use js::jsval::{JSVal, NullValue, ObjectValue, UndefinedValue};
@@ -1115,6 +1117,11 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.2
     fn GetContextAttributes(&self) -> Option<WebGLContextAttributes> {
         self.base.GetContextAttributes()
+    }
+
+    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.13
+    fn IsContextLost(&self) -> bool {
+        self.base.IsContextLost()
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.14
@@ -2914,6 +2921,243 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             .TexImage2D_(target, level, internal_format, format, data_type, source)
     }
 
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    fn TexImage2D__(
+        &self,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        width: i32,
+        height: i32,
+        border: i32,
+        format: u32,
+        type_: u32,
+        pbo_offset: i64,
+    ) -> Fallible<()> {
+        let pixel_unpack_buffer = match self.bound_pixel_unpack_buffer.get() {
+            Some(pixel_unpack_buffer) => pixel_unpack_buffer,
+            None => return Ok(self.base.webgl_error(InvalidOperation)),
+        };
+
+        if let Some(tf_buffer) = self.bound_transform_feedback_buffer.get() {
+            if pixel_unpack_buffer == tf_buffer {
+                return Ok(self.base.webgl_error(InvalidOperation));
+            }
+        }
+
+        if pbo_offset < 0 || pbo_offset as usize > pixel_unpack_buffer.capacity() {
+            return Ok(self.base.webgl_error(InvalidValue));
+        }
+
+        let unpacking_alignment = self.base.texture_unpacking_alignment();
+
+        let validator = TexImage2DValidator::new(
+            &self.base,
+            target,
+            level,
+            internalformat as u32,
+            width,
+            height,
+            border,
+            format,
+            type_,
+        );
+
+        let TexImage2DValidatorResult {
+            texture,
+            target,
+            width,
+            height,
+            level,
+            border,
+            internal_format,
+            format,
+            data_type,
+        } = match validator.validate() {
+            Ok(result) => result,
+            Err(_) => return Ok(()),
+        };
+
+        self.base.tex_image_2d(
+            &texture,
+            target,
+            data_type,
+            internal_format,
+            format,
+            level,
+            border,
+            unpacking_alignment,
+            Size2D::new(width, height),
+            TexSource::BufferOffset(pbo_offset),
+        );
+
+        Ok(())
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    fn TexImage2D___(
+        &self,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        width: i32,
+        height: i32,
+        border: i32,
+        format: u32,
+        type_: u32,
+        source: ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement,
+    ) -> Fallible<()> {
+        if self.bound_pixel_unpack_buffer.get().is_some() {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let validator = TexImage2DValidator::new(
+            &self.base,
+            target,
+            level,
+            internalformat as u32,
+            width,
+            height,
+            border,
+            format,
+            type_,
+        );
+
+        let TexImage2DValidatorResult {
+            texture,
+            target,
+            width: _,
+            height: _,
+            level,
+            border,
+            internal_format,
+            format,
+            data_type,
+        } = match validator.validate() {
+            Ok(result) => result,
+            Err(_) => return Ok(()),
+        };
+
+        let unpacking_alignment = self.base.texture_unpacking_alignment();
+
+        let pixels = match self.base.get_image_pixels(source)? {
+            Some(pixels) => pixels,
+            None => return Ok(()),
+        };
+
+        self.base.tex_image_2d(
+            &texture,
+            target,
+            data_type,
+            internal_format,
+            format,
+            level,
+            border,
+            unpacking_alignment,
+            pixels.size(),
+            TexSource::Pixels(pixels),
+        );
+
+        Ok(())
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    #[allow(unsafe_code)]
+    fn TexImage2D____(
+        &self,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        width: i32,
+        height: i32,
+        border: i32,
+        format: u32,
+        type_: u32,
+        src_data: CustomAutoRooterGuard<ArrayBufferView>,
+        src_offset: u32,
+    ) -> Fallible<()> {
+        if self.bound_pixel_unpack_buffer.get().is_some() {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        if type_ == constants::FLOAT_32_UNSIGNED_INT_24_8_REV {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let validator = TexImage2DValidator::new(
+            &self.base,
+            target,
+            level,
+            internalformat as u32,
+            width,
+            height,
+            border,
+            format,
+            type_,
+        );
+
+        let TexImage2DValidatorResult {
+            texture,
+            target,
+            width,
+            height,
+            level,
+            border,
+            internal_format,
+            format,
+            data_type,
+        } = match validator.validate() {
+            Ok(result) => result,
+            Err(_) => return Ok(()),
+        };
+
+        let unpacking_alignment = self.base.texture_unpacking_alignment();
+
+        let src_elem_size = typedarray_elem_size(src_data.get_array_type());
+        let src_byte_offset = src_offset as usize * src_elem_size;
+
+        if src_data.len() <= src_byte_offset {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let buff = IpcSharedMemory::from_bytes(unsafe { &src_data.as_slice()[src_byte_offset..] });
+
+        let expected_byte_length = match {
+            self.base.validate_tex_image_2d_data(
+                width,
+                height,
+                format,
+                data_type,
+                unpacking_alignment,
+                Some(&*src_data),
+            )
+        } {
+            Ok(byte_length) => byte_length,
+            Err(()) => return Ok(()),
+        };
+
+        if expected_byte_length as usize > buff.len() {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let size = Size2D::new(width, height);
+
+        self.base.tex_image_2d(
+            &texture,
+            target,
+            data_type,
+            internal_format,
+            format,
+            level,
+            border,
+            unpacking_alignment,
+            size,
+            TexSource::Pixels(TexPixels::from_array(buff, size)),
+        );
+
+        Ok(())
+    }
+
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn TexSubImage2D(
         &self,
@@ -4219,7 +4463,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     }
 }
 
-impl LayoutCanvasWebGLRenderingContextHelpers for LayoutDom<'_, WebGL2RenderingContext> {
+impl LayoutCanvasRenderingContextHelpers for LayoutDom<'_, WebGL2RenderingContext> {
     #[allow(unsafe_code)]
     unsafe fn canvas_data_source(self) -> HTMLCanvasDataSource {
         let this = &*self.unsafe_get();

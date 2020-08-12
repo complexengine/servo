@@ -7,6 +7,7 @@ use crate::dom::bindings::codegen::Bindings::XRSystemBinding::XRSessionInit;
 use crate::dom::bindings::codegen::Bindings::XRSystemBinding::{XRSessionMode, XRSystemMethods};
 use crate::dom::bindings::conversions::{ConversionResult, FromJSValConvertible};
 use crate::dom::bindings::error::Error;
+use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
@@ -25,6 +26,7 @@ use ipc_channel::ipc::{self as ipc_crate, IpcReceiver};
 use ipc_channel::router::ROUTER;
 use msg::constellation_msg::PipelineId;
 use profile_traits::ipc;
+use servo_config::pref;
 use std::cell::Cell;
 use std::rc::Rc;
 use webxr_api::{Error as XRError, Frame, Session, SessionInit, SessionMode};
@@ -160,8 +162,12 @@ impl XRSystemMethods for XRSystem {
 
         if mode != XRSessionMode::Inline {
             if !ScriptThread::is_user_interacting() {
-                promise.reject_error(Error::Security);
-                return promise;
+                if pref!(dom.webxr.unsafe_assume_user_intent) {
+                    warn!("The dom.webxr.unsafe-assume-user-intent preference assumes user intent to enter WebXR.");
+                } else {
+                    promise.reject_error(Error::Security);
+                    return promise;
+                }
             }
 
             if self.pending_or_active_session() {
@@ -214,6 +220,7 @@ impl XRSystemMethods for XRSystem {
         let init = SessionInit {
             required_features,
             optional_features,
+            first_person_observer_view: pref!(dom.webxr.first_person_observer_view),
         };
 
         let mut trusted = Some(TrustedPromise::new(promise.clone()));
@@ -288,5 +295,27 @@ impl XRSystem {
         // https://github.com/immersive-web/webxr/issues/961
         // This must be called _after_ the promise is resolved
         session.setup_initial_inputs();
+    }
+
+    // https://github.com/immersive-web/navigation/issues/10
+    pub fn dispatch_sessionavailable(&self) {
+        let xr = Trusted::new(self);
+        let global = self.global();
+        let window = global.as_window();
+        window
+            .task_manager()
+            .dom_manipulation_task_source()
+            .queue(
+                task!(fire_sessionavailable_event: move || {
+                    // The sessionavailable event indicates user intent to enter an XR session
+                    let xr = xr.root();
+                    let interacting = ScriptThread::is_user_interacting();
+                    ScriptThread::set_user_interacting(true);
+                    xr.upcast::<EventTarget>().fire_bubbling_event(atom!("sessionavailable"));
+                    ScriptThread::set_user_interacting(interacting);
+                }),
+                window.upcast(),
+            )
+            .unwrap();
     }
 }

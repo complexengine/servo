@@ -52,6 +52,7 @@ pub(crate) struct IntrinsicSizes {
 pub(crate) enum CanvasSource {
     WebGL(ImageKey),
     Image(Option<Arc<Mutex<IpcSender<CanvasMsg>>>>),
+    WebGPU(ImageKey),
 }
 
 impl fmt::Debug for CanvasSource {
@@ -62,6 +63,7 @@ impl fmt::Debug for CanvasSource {
             match *self {
                 CanvasSource::WebGL(_) => "WebGL",
                 CanvasSource::Image(_) => "Image",
+                CanvasSource::WebGPU(_) => "WebGPU",
             }
         )
     }
@@ -125,7 +127,7 @@ impl ReplacedContent {
                 image_url.clone(),
                 UsePlaceholder::No,
             ) {
-                Some(ImageOrMetadataAvailable::ImageAvailable(image, _)) => {
+                Some(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
                     (Some(image.clone()), image.width as f32, image.height as f32)
                 },
                 Some(ImageOrMetadataAvailable::MetadataAvailable(metadata)) => {
@@ -210,6 +212,7 @@ impl ReplacedContent {
 
                 let image_key = match canvas_info.source {
                     CanvasSource::WebGL(image_key) => image_key,
+                    CanvasSource::WebGPU(image_key) => image_key,
                     CanvasSource::Image(ref ipc_renderer) => match *ipc_renderer {
                         Some(ref ipc_renderer) => {
                             let ipc_renderer = ipc_renderer.lock().unwrap();

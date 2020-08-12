@@ -124,7 +124,7 @@ partial /*sealed*/ interface Document {
   [CEReactions, Throws]
   Document open(optional DOMString unused1, optional DOMString unused2);
   [CEReactions, Throws]
-  WindowProxy open(USVString url, DOMString name, DOMString features);
+  WindowProxy? open(USVString url, DOMString name, DOMString features);
   [CEReactions, Throws]
   void close();
   [CEReactions, Throws]
@@ -142,7 +142,7 @@ partial /*sealed*/ interface Document {
   // boolean queryCommandEnabled(DOMString commandId);
   // boolean queryCommandIndeterm(DOMString commandId);
   // boolean queryCommandState(DOMString commandId);
-  // boolean queryCommandSupported(DOMString commandId);
+  boolean queryCommandSupported(DOMString commandId);
   // DOMString queryCommandValue(DOMString commandId);
 
   // special event handler IDL attributes that only apply to Document objects

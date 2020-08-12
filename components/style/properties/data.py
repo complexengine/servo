@@ -198,11 +198,11 @@ class Longhand(object):
         self.gecko_pref = gecko_pref
         self.has_effect_on_gecko_scrollbars = has_effect_on_gecko_scrollbars
         assert (
-            has_effect_on_gecko_scrollbars in [None, False, True] and
-            not style_struct.inherited or
-            (gecko_pref is None) == (has_effect_on_gecko_scrollbars is None)), (
-            "Property " + name + ": has_effect_on_gecko_scrollbars must be " +
-            "specified, and must have a value of True or False, iff a " +
+            has_effect_on_gecko_scrollbars in [None, False, True]
+            and not style_struct.inherited
+            or (gecko_pref is None) == (has_effect_on_gecko_scrollbars is None)), (
+            "Property " + name + ": has_effect_on_gecko_scrollbars must be "
+            "specified, and must have a value of True or False, iff a "
             "property is inherited and is behind a Gecko pref")
         # For enabled_in, the setup is as follows:
         # It needs to be one of the four values: ["", "ua", "chrome", "content"]
@@ -328,6 +328,7 @@ class Longhand(object):
                 "AlignItems",
                 "AlignSelf",
                 "Appearance",
+                "AspectRatio",
                 "BreakBetween",
                 "BreakWithin",
                 "BackgroundRepeat",
@@ -356,6 +357,7 @@ class Longhand(object):
                 "JustifyItems",
                 "JustifySelf",
                 "LineBreak",
+                "MasonryAutoFlow",
                 "MozForceBrokenImageIcon",
                 "MozListReversed",
                 "MozScriptLevel",
@@ -363,7 +365,6 @@ class Longhand(object):
                 "MozScriptSizeMultiplier",
                 "TextDecorationSkipInk",
                 "NonNegativeNumber",
-                "Number",
                 "OffsetRotate",
                 "Opacity",
                 "OutlineStyle",
@@ -687,6 +688,7 @@ class PropertyRestrictions:
     def first_letter(data):
         props = set([
             "color",
+            "opacity",
             "float",
             "initial-letter",
 
@@ -721,6 +723,7 @@ class PropertyRestrictions:
         props = set([
             # Per spec.
             "color",
+            "opacity",
 
             # Kinda like css-fonts?
             "-moz-osx-font-smoothing",

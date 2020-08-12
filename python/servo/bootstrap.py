@@ -30,11 +30,11 @@ def run_as_root(command, force=False):
     if os.geteuid() != 0:
         command.insert(0, 'sudo')
     if force:
-        command += "-y"
+        command.append('-y')
     return subprocess.call(command)
 
 
-def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, force):
+def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, pkgs_void, force):
     install = False
     pkgs = []
     if context.distro in ['Ubuntu', 'Debian GNU/Linux']:
@@ -50,20 +50,27 @@ def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, force):
             if "|{}".format(p) not in installed_pkgs:
                 install = True
                 break
+    elif context.distro == 'void':
+        installed_pkgs = str(subprocess.check_output(['xbps-query', '-l']))
+        pkgs = pkgs_void
+        for p in pkgs:
+            command = ['xbps-install', '-A']
+            if "ii {}-".format(p) not in installed_pkgs:
+                install = force = True
+                break
 
     if install:
-        if force:
-            command.append('-y')
         print("Installing missing dependencies...")
-        run_as_root(command + pkgs)
-        return True
-    return False
+        run_as_root(command + pkgs, force)
+
+    return install
 
 
 def install_salt_dependencies(context, force):
     pkgs_apt = ['build-essential', 'libssl-dev', 'libffi-dev', 'python-dev']
     pkgs_dnf = ['gcc', 'libffi-devel', 'python-devel', 'openssl-devel']
-    if not install_linux_deps(context, pkgs_apt, pkgs_dnf, force):
+    pkgs_xbps = ['gcc', 'libffi-devel', 'python-devel']
+    if not install_linux_deps(context, pkgs_apt, pkgs_dnf, pkgs_xbps, force):
         print("Dependencies are already installed")
 
 
@@ -88,6 +95,7 @@ def linux(context, force=False):
                 'libgl1-mesa-dri', 'libglib2.0-dev', 'xorg-dev', 'gperf', 'g++',
                 'build-essential', 'cmake', 'libssl-dev',
                 'liblzma-dev', 'libxmu6', 'libxmu-dev',
+                "libxcb-render0-dev", "libxcb-shape0-dev", "libxcb-xfixes0-dev",
                 'libgles2-mesa-dev', 'libegl1-mesa-dev', 'libdbus-1-dev',
                 'libharfbuzz-dev', 'ccache', 'clang', 'libunwind-dev',
                 'libgstreamer1.0-dev', 'libgstreamer-plugins-base1.0-dev',
@@ -103,8 +111,17 @@ def linux(context, force=False):
                 'clang', 'clang-libs', 'autoconf213', 'python3-devel',
                 'gstreamer1-devel', 'gstreamer1-plugins-base-devel',
                 'gstreamer1-plugins-bad-free-devel']
+    pkgs_xbps = ['libtool', 'gcc', 'libXi-devel', 'freetype-devel',
+                 'libunwind-devel', 'MesaLib-devel', 'glib-devel', 'pkg-config',
+                 'libX11-devel', 'libXrandr-devel', 'gperf', 'bzip2-devel',
+                 'fontconfig-devel', 'cabextract', 'expat-devel', 'cmake',
+                 'cmake', 'libXcursor-devel', 'libXmu-devel', 'dbus-devel',
+                 'ncurses-devel', 'harfbuzz-devel', 'ccache', 'glu-devel',
+                 'clang', 'gstreamer1-devel', 'autoconf213',
+                 'gst-plugins-base1-devel', 'gst-plugins-bad1-devel']
 
-    installed_something = install_linux_deps(context, pkgs_apt, pkgs_dnf, force)
+    installed_something = install_linux_deps(context, pkgs_apt, pkgs_dnf,
+                                             pkgs_xbps, force)
 
     if not check_gstreamer_lib():
         installed_something |= gstreamer(context, force)
@@ -255,7 +272,8 @@ def windows_msvc(context, force=False):
         cmake_path = find_executable("cmake")
         if cmake_path:
             cmake = subprocess.Popen([cmake_path, "--version"], stdout=PIPE)
-            cmake_version = cmake.stdout.read().splitlines()[0].replace("cmake version ", "")
+            cmake_version_output = six.ensure_str(cmake.stdout.read()).splitlines()[0]
+            cmake_version = cmake_version_output.replace("cmake version ", "")
             if LooseVersion(cmake_version) >= LooseVersion(version):
                 return True
         return False
@@ -321,7 +339,9 @@ def get_linux_distribution():
         else:
             major = version
 
-        if major == '19':
+        if major == '20':
+            base_version = '20.04'
+        elif major == '19':
             base_version = '18.04'
         elif major == '18':
             base_version = '16.04'
@@ -335,7 +355,9 @@ def get_linux_distribution():
         else:
             major = version
 
-        if major == '19':
+        if major == '20':
+            base_version = '20.04'
+        elif major == '19':
             base_version = '18.04'
         elif major == '18':
             base_version = '16.04'
@@ -360,6 +382,7 @@ def get_linux_distribution():
         'centos linux',
         'debian gnu/linux',
         'fedora',
+        'void',
     ]:
         raise Exception('mach bootstrap does not support %s, please file a bug' % distrib)
 

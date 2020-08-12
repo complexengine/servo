@@ -101,7 +101,7 @@ impl FetchResponseListener for StylesheetContext {
     fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
         if let Ok(FetchMetadata::Filtered { ref filtered, .. }) = metadata {
             match *filtered {
-                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect => {
+                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
                     self.origin_clean = false;
                 },
                 _ => {},
@@ -324,7 +324,7 @@ impl<'a> StylesheetLoader<'a> {
             cors_setting,
             document.origin().immutable().clone(),
             self.elem.global().pipeline_id(),
-            Referrer::ReferrerUrl(document.url()),
+            self.elem.global().get_referrer(),
             referrer_policy,
             integrity_metadata,
         );
@@ -344,10 +344,9 @@ pub(crate) fn stylesheet_fetch_request(
     referrer_policy: Option<ReferrerPolicy>,
     integrity_metadata: String,
 ) -> RequestBuilder {
-    create_a_potential_cors_request(url, Destination::Style, cors_setting, None)
+    create_a_potential_cors_request(url, Destination::Style, cors_setting, None, referrer)
         .origin(origin)
         .pipeline_id(Some(pipeline_id))
-        .referrer(Some(referrer))
         .referrer_policy(referrer_policy)
         .integrity_metadata(integrity_metadata)
 }

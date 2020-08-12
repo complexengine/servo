@@ -45,6 +45,14 @@ dictionary TestDictionary {
   DOMString? nonRequiredNullable2;
 };
 
+dictionary TestDictionaryParent {
+  DOMString parentStringMember;
+};
+
+dictionary TestDictionaryWithParent : TestDictionaryParent {
+  DOMString stringMember;
+};
+
 dictionary TestDictionaryDefaults {
   boolean booleanValue = false;
   byte byteValue = 7;
@@ -517,7 +525,7 @@ interface TestBinding {
   [Pref="dom.testbinding.prefcontrolled.enabled"]
   const unsigned short prefControlledConstDisabled = 0;
   [Pref="layout.animations.test.enabled"]
-  void advanceClock(long millis, optional boolean forceLayoutTick = true);
+  void advanceClock(long millis);
 
   [Pref="dom.testbinding.prefcontrolled2.enabled"]
   readonly attribute boolean prefControlledAttributeEnabled;
@@ -571,6 +579,8 @@ interface TestBinding {
 
   [Exposed=(Window)]
   readonly attribute boolean semiExposedBoolFromInterface;
+
+  TestDictionaryWithParent getDictionaryWithParent(DOMString parent, DOMString child);
 };
 
 [Exposed=(Window)]

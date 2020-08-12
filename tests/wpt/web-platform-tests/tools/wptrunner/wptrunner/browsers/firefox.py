@@ -24,6 +24,7 @@ from .base import (get_free_port,
 from ..executors import executor_kwargs as base_executor_kwargs
 from ..executors.executormarionette import (MarionetteTestharnessExecutor,  # noqa: F401
                                             MarionetteRefTestExecutor,  # noqa: F401
+                                            MarionettePrintRefTestExecutor,  # noqa: F401
                                             MarionetteWdspecExecutor,  # noqa: F401
                                             MarionetteCrashtestExecutor)  # noqa: F401
 from ..process import cast_env
@@ -37,6 +38,7 @@ __wptrunner__ = {"product": "firefox",
                  "executor": {"crashtest": "MarionetteCrashtestExecutor",
                               "testharness": "MarionetteTestharnessExecutor",
                               "reftest": "MarionetteRefTestExecutor",
+                              "print-reftest": "MarionettePrintRefTestExecutor",
                               "wdspec": "MarionetteWdspecExecutor"},
                  "browser_kwargs": "browser_kwargs",
                  "executor_kwargs": "executor_kwargs",
@@ -115,7 +117,7 @@ def executor_kwargs(test_type, server_config, cache_manager, run_info_data,
     capabilities = {}
     if test_type == "testharness":
         capabilities["pageLoadStrategy"] = "eager"
-    if test_type == "reftest":
+    if test_type in ("reftest", "print-reftest"):
         executor_kwargs["reftest_internal"] = kwargs["reftest_internal"]
         executor_kwargs["reftest_screenshot"] = kwargs["reftest_screenshot"]
     if test_type == "wdspec":
@@ -272,9 +274,6 @@ class FirefoxInstanceManager(object):
         if self.enable_webrender:
             env["MOZ_WEBRENDER"] = "1"
             env["MOZ_ACCELERATED"] = "1"
-            # Set MOZ_X_SYNC and GDK_SYNCHRONIZE for investigation; bug 1625250.
-            env["MOZ_X_SYNC"] = "1"
-            env["GDK_SYNCHRONIZE"] = "1"
         else:
             env["MOZ_WEBRENDER"] = "0"
 
@@ -369,7 +368,8 @@ class BrowserInstance(object):
 
     def stop(self, force=False, skip_marionette=False):
         """Stop Firefox"""
-        if self.runner is not None and self.runner.is_running():
+        is_running = self.runner is not None and self.runner.is_running()
+        if is_running:
             self.logger.debug("Stopping Firefox %s" % self.pid())
             shutdown_methods = [(True, lambda: self.runner.wait(self.shutdown_timeout)),
                                 (False, lambda: self.runner.stop(signal.SIGTERM)),
@@ -388,8 +388,12 @@ class BrowserInstance(object):
             except OSError:
                 # This can happen on Windows if the process is already dead
                 pass
+        elif self.runner:
+            # The browser was already stopped, which we assume was a crash
+            # TODO: Should we check the exit code here?
+            clean = False
         if not skip_marionette:
-            self.output_handler.after_stop()
+            self.output_handler.after_stop(clean_shutdown=clean)
 
     def pid(self):
         if self.runner.process_handler is None:
@@ -428,8 +432,11 @@ class OutputHandler(object):
 
         self.symbols_path = symbols_path
         if stackfix_dir:
+            # We hide errors because they cause disconcerting `CRITICAL`
+            # warnings in web platform test output.
             self.stack_fixer = get_stack_fixer_function(stackfix_dir,
-                                                        self.symbols_path)
+                                                        self.symbols_path,
+                                                        hideErrors=True)
         else:
             self.stack_fixer = None
         self.asan = asan
@@ -442,8 +449,8 @@ class OutputHandler(object):
         self.line_buffer = []
         self.setup_ran = False
 
-    def setup(self, instance=None, group_metadata=None, lsan_allowed=None,
-              lsan_max_stack_depth=None, mozleak_allowed=None,
+    def setup(self, instance=None, group_metadata=None, lsan_disabled=False,
+              lsan_allowed=None, lsan_max_stack_depth=None, mozleak_allowed=None,
               mozleak_thresholds=None, **kwargs):
         """Configure the output handler"""
         self.instance = instance
@@ -459,7 +466,8 @@ class OutputHandler(object):
             self.lsan_handler = mozleak.LSANLeaks(self.logger,
                                                   scope=group_metadata.get("scope", "/"),
                                                   allowed=lsan_allowed,
-                                                  maxNumRecordedFrames=lsan_max_stack_depth)
+                                                  maxNumRecordedFrames=lsan_max_stack_depth,
+                                                  allowAll=lsan_disabled)
         else:
             self.lsan_handler = None
 
@@ -469,26 +477,30 @@ class OutputHandler(object):
             self.__call__(line)
         self.line_buffer = []
 
-    def after_stop(self):
+    def after_stop(self, clean_shutdown=True):
         self.logger.info("PROCESS LEAKS %s" % self.instance.leak_report_file)
         if self.lsan_handler:
             self.lsan_handler.process()
         if self.instance.leak_report_file is not None:
-            # We have to ignore missing leaks in the tab because it can happen that the
-            # content process crashed and in that case we don't want the test to fail.
-            # Ideally we would record which content process crashed and just skip those.
-            mozleak.process_leak_log(
-                self.instance.leak_report_file,
-                leak_thresholds=self.mozleak_thresholds,
-                ignore_missing_leaks=["tab", "gmplugin"],
-                log=self.logger,
-                stack_fixer=self.stack_fixer,
-                scope=self.group_metadata.get("scope"),
-                allowed=self.mozleak_allowed)
+            if not clean_shutdown:
+                # If we didn't get a clean shutdown there probably isn't a leak report file
+                self.logger.warning("Firefox didn't exit cleanly, not processing leak logs")
+            else:
+                # We have to ignore missing leaks in the tab because it can happen that the
+                # content process crashed and in that case we don't want the test to fail.
+                # Ideally we would record which content process crashed and just skip those.
+                mozleak.process_leak_log(
+                    self.instance.leak_report_file,
+                    leak_thresholds=self.mozleak_thresholds,
+                    ignore_missing_leaks=["tab", "gmplugin"],
+                    log=self.logger,
+                    stack_fixer=self.stack_fixer,
+                    scope=self.group_metadata.get("scope"),
+                    allowed=self.mozleak_allowed)
 
     def __call__(self, line):
         """Write a line of output from the firefox process to the log"""
-        if "GLib-GObject-CRITICAL" in line:
+        if b"GLib-GObject-CRITICAL" in line:
             return
         if line:
             if not self.setup_ran:
@@ -589,8 +601,11 @@ class ProfileCreator(object):
         if self.enable_fission:
             profile.set_preferences({"fission.autostart": True})
 
-        if self.test_type == "reftest":
+        if self.test_type in ("reftest", "print-reftest"):
             profile.set_preferences({"layout.interruptible-reflow.enabled": False})
+
+        if self.test_type == "print-reftest":
+            profile.set_preferences({"print.always_print_silent": True})
 
         # Bug 1262954: winxp + e10s, disable hwaccel
         if (self.e10s and platform.system() in ("Windows", "Microsoft") and
@@ -709,6 +724,7 @@ class FirefoxBrowser(Browser):
 
     def settings(self, test):
         return {"check_leaks": self.leak_check and not test.leaks,
+                "lsan_disabled": test.lsan_disabled,
                 "lsan_allowed": test.lsan_allowed,
                 "lsan_max_stack_depth": test.lsan_max_stack_depth,
                 "mozleak_allowed": self.leak_check and test.mozleak_allowed,

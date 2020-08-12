@@ -340,7 +340,7 @@ impl FetchResponseListener for EventSourceContext {
                 let meta = match fm {
                     FetchMetadata::Unfiltered(m) => m,
                     FetchMetadata::Filtered { unsafe_, filtered } => match filtered {
-                        FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect => {
+                        FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
                             return self.fail_the_connection()
                         },
                         _ => unsafe_,
@@ -532,6 +532,7 @@ impl EventSource {
             Destination::None,
             Some(cors_attribute_state),
             Some(true),
+            global.get_referrer(),
         )
         .origin(global.origin().immutable().clone())
         .pipeline_id(Some(global.pipeline_id()));

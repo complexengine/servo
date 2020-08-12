@@ -7,11 +7,12 @@
 /// Connection point for all new remote devtools interactions, providing lists of know actors
 /// that perform more specific actions (targets, addons, browser chrome, etc.)
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::actors::browsing_context::{BrowsingContextActor, BrowsingContextActorMsg};
 use crate::actors::device::DeviceActor;
 use crate::actors::performance::PerformanceActor;
+use crate::actors::tab::{TabDescriptorActor, TabDescriptorActorMsg};
 use crate::actors::worker::{WorkerActor, WorkerMsg};
 use crate::protocol::{ActorDescription, JsonPacketStream};
+use crate::StreamId;
 use serde_json::{Map, Value};
 use std::net::TcpStream;
 
@@ -45,13 +46,13 @@ struct GetRootReply {
 struct ListTabsReply {
     from: String,
     selected: u32,
-    tabs: Vec<BrowsingContextActorMsg>,
+    tabs: Vec<TabDescriptorActorMsg>,
 }
 
 #[derive(Serialize)]
 struct GetTabReply {
     from: String,
-    tab: BrowsingContextActorMsg,
+    tab: TabDescriptorActorMsg,
 }
 
 #[derive(Serialize)]
@@ -124,6 +125,7 @@ impl Actor for RootActor {
         msg_type: &str,
         _msg: &Map<String, Value>,
         stream: &mut TcpStream,
+        _id: StreamId,
     ) -> Result<ActorMessageStatus, ()> {
         Ok(match msg_type {
             "listAddons" => {
@@ -131,7 +133,7 @@ impl Actor for RootActor {
                     from: "root".to_owned(),
                     addons: vec![],
                 };
-                stream.write_json_packet(&actor);
+                let _ = stream.write_json_packet(&actor);
                 ActorMessageStatus::Processed
             },
 
@@ -144,7 +146,7 @@ impl Actor for RootActor {
                         isParent: true,
                     }],
                 };
-                stream.write_json_packet(&reply);
+                let _ = stream.write_json_packet(&reply);
                 ActorMessageStatus::Processed
             },
 
@@ -157,7 +159,7 @@ impl Actor for RootActor {
                         isParent: true,
                     },
                 };
-                stream.write_json_packet(&reply);
+                let _ = stream.write_json_packet(&reply);
                 ActorMessageStatus::Processed
             },
 
@@ -169,7 +171,7 @@ impl Actor for RootActor {
                     deviceActor: self.device.clone(),
                     preferenceActor: self.preference.clone(),
                 };
-                stream.write_json_packet(&actor);
+                let _ = stream.write_json_packet(&actor);
                 ActorMessageStatus::Processed
             },
 
@@ -181,10 +183,14 @@ impl Actor for RootActor {
                     tabs: self
                         .tabs
                         .iter()
-                        .map(|target| registry.find::<BrowsingContextActor>(target).encodable())
+                        .map(|target| {
+                            registry
+                                .find::<TabDescriptorActor>(target)
+                                .encodable(&registry)
+                        })
                         .collect(),
                 };
-                stream.write_json_packet(&actor);
+                let _ = stream.write_json_packet(&actor);
                 ActorMessageStatus::Processed
             },
 
@@ -193,7 +199,7 @@ impl Actor for RootActor {
                     from: self.name(),
                     registrations: vec![],
                 };
-                stream.write_json_packet(&reply);
+                let _ = stream.write_json_packet(&reply);
                 ActorMessageStatus::Processed
             },
 
@@ -206,17 +212,17 @@ impl Actor for RootActor {
                         .map(|name| registry.find::<WorkerActor>(name).encodable())
                         .collect(),
                 };
-                stream.write_json_packet(&reply);
+                let _ = stream.write_json_packet(&reply);
                 ActorMessageStatus::Processed
             },
 
             "getTab" => {
-                let tab = registry.find::<BrowsingContextActor>(&self.tabs[0]);
+                let tab = registry.find::<TabDescriptorActor>(&self.tabs[0]);
                 let reply = GetTabReply {
                     from: self.name(),
-                    tab: tab.encodable(),
+                    tab: tab.encodable(&registry),
                 };
-                stream.write_json_packet(&reply);
+                let _ = stream.write_json_packet(&reply);
                 ActorMessageStatus::Processed
             },
 
@@ -228,7 +234,7 @@ impl Actor for RootActor {
                         device: DeviceActor::description(),
                     },
                 };
-                stream.write_json_packet(&msg);
+                let _ = stream.write_json_packet(&msg);
                 ActorMessageStatus::Processed
             },
 
@@ -243,10 +249,10 @@ impl RootActor {
             from: "root".to_owned(),
             applicationType: "browser".to_owned(),
             traits: ActorTraits {
-                sources: true,
+                sources: false,
                 highlightable: true,
                 customHighlighters: true,
-                networkMonitor: true,
+                networkMonitor: false,
             },
         }
     }

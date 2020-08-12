@@ -30,7 +30,6 @@ use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use ipc_channel::ipc;
 use msg::constellation_msg::{BrowsingContextId, PipelineId, TopLevelBrowsingContextId};
-use net_traits::request::Referrer;
 use profile_traits::ipc as ProfiledIpc;
 use script_layout_interface::message::ReflowGoal;
 use script_traits::IFrameSandboxState::{IFrameSandboxed, IFrameUnsandboxed};
@@ -242,14 +241,14 @@ impl HTMLIFrameElement {
                 LoadOrigin::Script(document.origin().immutable().clone()),
                 url,
                 pipeline_id,
-                Some(Referrer::ReferrerUrl(document.url())),
+                window.upcast::<GlobalScope>().get_referrer(),
                 document.get_referrer_policy(),
             );
             let element = self.upcast::<Element>();
             load_data.srcdoc = String::from(element.get_string_attribute(&local_name!("srcdoc")));
             self.navigate_or_reload_child_browsing_context(
                 load_data,
-                NavigationType::InitialAboutBlank,
+                NavigationType::Regular,
                 HistoryEntryReplacement::Disabled,
             );
             return;
@@ -325,7 +324,7 @@ impl HTMLIFrameElement {
             LoadOrigin::Script(document.origin().immutable().clone()),
             url,
             creator_pipeline_id,
-            Some(Referrer::ReferrerUrl(document.url())),
+            window.upcast::<GlobalScope>().get_referrer(),
             document.get_referrer_policy(),
         );
 
@@ -352,7 +351,7 @@ impl HTMLIFrameElement {
             LoadOrigin::Script(document.origin().immutable().clone()),
             url,
             pipeline_id,
-            Some(Referrer::ReferrerUrl(document.url().clone())),
+            window.upcast::<GlobalScope>().get_referrer(),
             document.get_referrer_policy(),
         );
         let browsing_context_id = BrowsingContextId::new();

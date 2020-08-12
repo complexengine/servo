@@ -101,8 +101,10 @@ pub enum LayoutNodeType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutElementType {
     Element,
+    HTMLBodyElement,
     HTMLBRElement,
     HTMLCanvasElement,
+    HTMLHtmlElement,
     HTMLIFrameElement,
     HTMLImageElement,
     HTMLInputElement,
@@ -121,6 +123,7 @@ pub enum LayoutElementType {
 pub enum HTMLCanvasDataSource {
     WebGL(webrender_api::ImageKey),
     Image(Option<IpcSender<CanvasMsg>>),
+    WebGPU(webrender_api::ImageKey),
 }
 
 pub struct HTMLCanvasData {

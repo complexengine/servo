@@ -194,6 +194,7 @@ interface HTMLLinkElement : HTMLElement {
   [CEReactions] attribute USVString imageSrcset;
   [CEReactions] attribute DOMString imageSizes;
   [CEReactions] attribute DOMString referrerPolicy;
+  [CEReactions] attribute boolean disabled;
 };
 HTMLLinkElement includes LinkStyle;
 
@@ -1504,7 +1505,7 @@ interface ElementInternals {
 
   readonly attribute HTMLFormElement? form;
 
-  void setValidity(ValidityStateFlags flags,
+  void setValidity(optional ValidityStateFlags flags = {},
                    optional DOMString message,
                    optional HTMLElement anchor);
   readonly attribute boolean willValidate;

@@ -3,7 +3,6 @@ import platform
 import re
 import shutil
 import stat
-import errno
 import subprocess
 import tempfile
 from abc import ABCMeta, abstractmethod
@@ -13,13 +12,12 @@ from distutils.spawn import find_executable
 from six.moves.urllib.parse import urlsplit
 import requests
 
-from .utils import call, get, untar, unzip
+from .utils import call, get, rmtree, untar, unzip
 
 uname = platform.uname()
 
 # the rootUrl for the firefox-ci deployment of Taskcluster
-# (after November 9, https://firefox-ci-tc.services.mozilla.com/)
-FIREFOX_CI_ROOT_URL = 'https://taskcluster.net'
+FIREFOX_CI_ROOT_URL = 'https://firefox-ci-tc.services.mozilla.com'
 
 
 def _get_fileversion(binary, logger=None):
@@ -32,15 +30,6 @@ def _get_fileversion(binary, logger=None):
         return None
 
 
-def handle_remove_readonly(func, path, exc):
-    excvalue = exc[1]
-    if func in (os.rmdir, os.remove) and excvalue.errno == errno.EACCES:
-        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)  # 0777
-        func(path)
-    else:
-        raise
-
-
 def get_ext(filename):
     """Get the extension from a filename with special handling for .tar.foo"""
     name, ext = os.path.splitext(filename)
@@ -49,11 +38,32 @@ def get_ext(filename):
     return ext
 
 
+def get_taskcluster_artifact(index, path):
+    TC_INDEX_BASE = FIREFOX_CI_ROOT_URL + "/api/index/v1/"
+
+    resp = get(TC_INDEX_BASE + "task/%s/artifacts/%s" % (index, path))
+    resp.raise_for_status()
+
+    return resp
+
+
 class Browser(object):
     __metaclass__ = ABCMeta
 
     def __init__(self, logger):
         self.logger = logger
+
+    def _get_dest(self, dest, channel):
+        if dest is None:
+            # os.getcwd() doesn't include the venv path
+            dest = os.path.join(os.getcwd(), "_venv")
+
+        dest = os.path.join(dest, "browsers", channel)
+
+        if not os.path.exists(dest):
+            os.makedirs(dest)
+
+        return dest
 
     @abstractmethod
     def download(self, dest=None, channel=None, rename=None):
@@ -62,17 +72,31 @@ class Browser(object):
         :param channel: Browser channel to download
         :param rename: Optional name for the downloaded package; the original
                        extension is preserved.
+        :return: The path to the downloaded package/installer
         """
         return NotImplemented
 
     @abstractmethod
-    def install(self, dest=None):
-        """Install the browser."""
+    def install(self, dest=None, channel=None):
+        """Download and install the browser.
+
+        This method usually calls download().
+
+        :param dest: Directory in which to install the browser
+        :param channel: Browser channel to install
+        :return: The path to the installed browser
+        """
         return NotImplemented
 
     @abstractmethod
     def install_webdriver(self, dest=None, channel=None, browser_binary=None):
-        """Install the WebDriver implementation for this browser."""
+        """Download and install the WebDriver implementation for this browser.
+
+        :param dest: Directory in which to install the WebDriver
+        :param channel: Browser channel to install
+        :param browser_binary: The path to the browser binary
+        :return: The path to the installed WebDriver
+        """
         return NotImplemented
 
     @abstractmethod
@@ -134,18 +158,6 @@ class Firefox(Browser):
 
         return "%s%s" % (self.platform, bits)
 
-    def _get_dest(self, dest, channel):
-        if dest is None:
-            # os.getcwd() doesn't include the venv path
-            dest = os.path.join(os.getcwd(), "_venv")
-
-        dest = os.path.join(dest, "browsers", channel)
-
-        if not os.path.exists(dest):
-            os.makedirs(dest)
-
-        return dest
-
     def download(self, dest=None, channel="nightly", rename=None):
         product = {
             "nightly": "firefox-nightly-latest-ssl",
@@ -174,7 +186,7 @@ class Firefox(Browser):
         url = "https://download.mozilla.org/?product=%s&os=%s&lang=en-US" % (product[channel],
                                                                              os_builds[os_key])
         self.logger.info("Downloading Firefox from %s" % url)
-        resp = requests.get(url)
+        resp = get(url)
 
         filename = None
 
@@ -352,7 +364,7 @@ class Firefox(Browser):
         # If we don't have a recent download, grab and extract the latest one
         if not have_cache:
             if os.path.exists(dest):
-                shutil.rmtree(dest)
+                rmtree(dest)
             os.makedirs(dest)
 
             url = self.get_profile_bundle_url(version, channel)
@@ -367,7 +379,7 @@ class Firefox(Browser):
                     path = os.path.join(profiles, name)
                     shutil.move(path, dest)
             finally:
-                shutil.rmtree(extract_dir)
+                rmtree(extract_dir)
         else:
             self.logger.info("Using cached test prefs from %s" % dest)
 
@@ -379,14 +391,14 @@ class Firefox(Browser):
         tags = call("git", "ls-remote", "--tags", "--refs",
                     "https://github.com/mozilla/geckodriver.git")
         release_re = re.compile(r".*refs/tags/v(\d+)\.(\d+)\.(\d+)")
-        latest_release = (0,0,0)
+        latest_release = (0, 0, 0)
         for item in tags.split("\n"):
             m = release_re.match(item)
             if m:
                 version = tuple(int(item) for item in m.groups())
                 if version > latest_release:
                     latest_release = version
-        assert latest_release != (0,0,0)
+        assert latest_release != (0, 0, 0)
         return "v%s.%s.%s" % tuple(str(item) for item in latest_release)
 
     def install_webdriver(self, dest=None, channel=None, browser_binary=None):
@@ -394,51 +406,56 @@ class Firefox(Browser):
         if dest is None:
             dest = os.getcwd()
 
+        path = None
         if channel == "nightly":
             path = self.install_geckodriver_nightly(dest)
-            if path is not None:
-                return path
-            else:
+            if path is None:
                 self.logger.warning("Nightly webdriver not found; falling back to release")
 
-        version = self._latest_geckodriver_version()
-        format = "zip" if uname[0] == "Windows" else "tar.gz"
-        self.logger.debug("Latest geckodriver release %s" % version)
-        url = ("https://github.com/mozilla/geckodriver/releases/download/%s/geckodriver-%s-%s.%s" %
-               (version, version, self.platform_string_geckodriver(), format))
-        if format == "zip":
-            unzip(get(url).raw, dest=dest)
-        else:
-            untar(get(url).raw, dest=dest)
-        return find_executable(os.path.join(dest, "geckodriver"))
+        if path is None:
+            version = self._latest_geckodriver_version()
+            format = "zip" if uname[0] == "Windows" else "tar.gz"
+            self.logger.debug("Latest geckodriver release %s" % version)
+            url = ("https://github.com/mozilla/geckodriver/releases/download/%s/geckodriver-%s-%s.%s" %
+                   (version, version, self.platform_string_geckodriver(), format))
+            if format == "zip":
+                unzip(get(url).raw, dest=dest)
+            else:
+                untar(get(url).raw, dest=dest)
+            path = find_executable(os.path.join(dest, "geckodriver"))
+
+        assert path is not None
+        self.logger.info("Installed %s" %
+                         subprocess.check_output([path, "--version"]).splitlines()[0])
+        return path
 
     def install_geckodriver_nightly(self, dest):
-        import tarfile
-        import mozdownload
         self.logger.info("Attempting to install webdriver from nightly")
-        try:
-            s = mozdownload.DailyScraper(branch="mozilla-central",
-                                         extension="common.tests.tar.gz",
-                                         destination=dest)
-            package_path = s.download()
-        except mozdownload.errors.NotFoundError:
-            return
+
+        platform_bits = ("64" if uname[4] == "x86_64" else
+                         ("32" if self.platform == "win" else ""))
+        tc_platform = "%s%s" % (self.platform, platform_bits)
+
+        archive_ext = ".zip" if uname[0] == "Windows" else ".tar.gz"
+        archive_name = "public/build/geckodriver%s" % archive_ext
 
         try:
-            exe_suffix = ".exe" if uname[0] == "Windows" else ""
-            with tarfile.open(package_path, "r") as f:
-                try:
-                    member = f.getmember("bin%sgeckodriver%s" % (os.path.sep,
-                                                                 exe_suffix))
-                except KeyError:
-                    return
-                # Remove bin/ from the path.
-                member.name = os.path.basename(member.name)
-                f.extractall(members=[member], path=dest)
-                path = os.path.join(dest, member.name)
-            self.logger.info("Extracted geckodriver to %s" % path)
-        finally:
-            os.unlink(package_path)
+            resp = get_taskcluster_artifact(
+                "gecko.v2.mozilla-central.latest.geckodriver.%s" % tc_platform,
+                archive_name)
+        except Exception:
+            self.logger.info("Geckodriver download failed")
+            return
+
+        if archive_ext == ".zip":
+            unzip(resp.raw, dest)
+        else:
+            untar(resp.raw, dest)
+
+        exe_ext = ".exe" if uname[0] == "Windows" else ""
+        path = os.path.join(dest, "geckodriver%s" % exe_ext)
+
+        self.logger.info("Extracted geckodriver to %s" % path)
 
         return path
 
@@ -457,38 +474,27 @@ class FirefoxAndroid(Browser):
     product = "firefox_android"
     requirements = "requirements_firefox.txt"
 
+    def __init__(self, logger):
+        super(FirefoxAndroid, self).__init__(logger)
+        self.apk_path = None
+
     def download(self, dest=None, channel=None, rename=None):
         if dest is None:
             dest = os.pwd
 
-        if FIREFOX_CI_ROOT_URL == 'https://taskcluster.net':
-            # NOTE: this condition can be removed after November 9, 2019
-            TC_QUEUE_BASE = "https://queue.taskcluster.net/v1/"
-            TC_INDEX_BASE = "https://index.taskcluster.net/v1/"
-        else:
-            TC_QUEUE_BASE = FIREFOX_CI_ROOT_URL + "/api/queue/v1/"
-            TC_INDEX_BASE = FIREFOX_CI_ROOT_URL + "/api/index/v1/"
-
-
-        resp = requests.get(TC_INDEX_BASE +
-                            "task/gecko.v2.mozilla-central.latest.mobile.android-x86_64-opt")
-        resp.raise_for_status()
-        index = resp.json()
-        task_id = index["taskId"]
-
-        resp = requests.get(TC_QUEUE_BASE + "task/%s/artifacts/%s" %
-                            (task_id, "public/build/geckoview-androidTest.apk"))
-        resp.raise_for_status()
+        resp = get_taskcluster_artifact(
+            "gecko.v2.mozilla-central.latest.mobile.android-x86_64-opt",
+            "public/build/geckoview-androidTest.apk")
 
         filename = "geckoview-androidTest.apk"
         if rename:
             filename = "%s%s" % (rename, get_ext(filename)[1])
-        apk_path = os.path.join(dest, filename)
+        self.apk_path = os.path.join(dest, filename)
 
-        with open(apk_path, "wb") as f:
+        with open(self.apk_path, "wb") as f:
             f.write(resp.content)
 
-        return apk_path
+        return self.apk_path
 
     def install(self, dest=None, channel=None):
         return self.download(dest, channel)
@@ -498,7 +504,7 @@ class FirefoxAndroid(Browser):
         return fx_browser.install_prefs(binary, dest, channel)
 
     def find_binary(self, venv_path=None, channel=None):
-        raise NotImplementedError
+        return self.apk_path
 
     def find_webdriver(self, channel=None):
         raise NotImplementedError
@@ -518,22 +524,53 @@ class Chrome(Browser):
 
     product = "chrome"
     requirements = "requirements_chrome.txt"
+    platforms = {
+        "Linux": "Linux",
+        "Windows": "Win",
+        "Darwin": "Mac",
+    }
+
+    def __init__(self, logger):
+        super(Chrome, self).__init__(logger)
+        self._last_change = None
 
     def download(self, dest=None, channel=None, rename=None):
-        raise NotImplementedError
+        if channel != "nightly":
+            raise NotImplementedError("We can only download Chrome Nightly (Chromium ToT) for you.")
+        if dest is None:
+            dest = self._get_dest(None, channel)
+
+        filename = self._chromium_package_name() + ".zip"
+        url = self._latest_chromium_snapshot_url() + filename
+        self.logger.info("Downloading Chrome from %s" % url)
+        resp = get(url)
+        installer_path = os.path.join(dest, filename)
+        with open(installer_path, "wb") as f:
+            f.write(resp.content)
+        return installer_path
 
     def install(self, dest=None, channel=None):
-        raise NotImplementedError
+        if channel != "nightly":
+            raise NotImplementedError("We can only install Chrome Nightly (Chromium ToT) for you.")
+        dest = self._get_dest(dest, channel)
 
-    def platform_string(self):
-        platform = {
-            "Linux": "linux",
-            "Windows": "win",
-            "Darwin": "mac"
-        }.get(uname[0])
+        installer_path = self.download(dest, channel)
+        with open(installer_path, "rb") as f:
+            unzip(f, dest)
+        os.remove(installer_path)
+        return self.find_nightly_binary(dest)
+
+    def install_mojojs(self, dest):
+        url = self._latest_chromium_snapshot_url() + "mojojs.zip"
+        self.logger.info("Downloading Mojo bindings from %s" % url)
+        unzip(get(url).raw, dest)
+
+    def _chromedriver_platform_string(self):
+        platform = self.platforms.get(uname[0])
 
         if platform is None:
             raise ValueError("Unable to construct a valid Chrome package name for current platform")
+        platform = platform.lower()
 
         if platform == "linux":
             bits = "64" if uname[4] == "x86_64" else "32"
@@ -544,12 +581,8 @@ class Chrome(Browser):
 
         return "%s%s" % (platform, bits)
 
-    def chromium_platform_string(self):
-        platform = {
-            "Linux": "Linux",
-            "Windows": "Win",
-            "Darwin": "Mac"
-        }.get(uname[0])
+    def _chromium_platform_string(self):
+        platform = self.platforms.get(uname[0])
 
         if platform is None:
             raise ValueError("Unable to construct a valid Chromium package name for current platform")
@@ -559,7 +592,28 @@ class Chrome(Browser):
 
         return platform
 
+    def _chromium_package_name(self):
+        return "chrome-%s" % self.platforms.get(uname[0]).lower()
+
+    def _latest_chromium_snapshot_url(self):
+        # Make sure we use the same revision in an invocation.
+        architecture = self._chromium_platform_string()
+        if self._last_change is None:
+            revision_url = "https://storage.googleapis.com/chromium-browser-snapshots/%s/LAST_CHANGE" % architecture
+            self._last_change = get(revision_url).text.strip()
+        return "https://storage.googleapis.com/chromium-browser-snapshots/%s/%s/" % (architecture, self._last_change)
+
+    def find_nightly_binary(self, dest):
+        if uname[0] == "Darwin":
+            return find_executable("Chromium",
+                                   os.path.join(dest, self._chromium_package_name(), "Chromium.app", "Contents", "MacOS"))
+        # find_executable will add .exe on Windows automatically.
+        return find_executable("chrome", os.path.join(dest, self._chromium_package_name()))
+
     def find_binary(self, venv_path=None, channel=None):
+        if channel == "nightly":
+            return self.find_nightly_binary(self._get_dest(venv_path, channel))
+
         if uname[0] == "Linux":
             name = "google-chrome"
             if channel == "stable":
@@ -597,25 +651,23 @@ class Chrome(Browser):
             except requests.RequestException:
                 return None
         return "https://chromedriver.storage.googleapis.com/%s/chromedriver_%s.zip" % (
-            latest, self.platform_string())
+            latest, self._chromedriver_platform_string())
 
     def _chromium_chromedriver_url(self, chrome_version):
-        try:
-            # Try to find the Chromium build with the same revision.
-            omaha = get("https://omahaproxy.appspot.com/deps.json?version=" + chrome_version).json()
-            revision = omaha['chromium_base_position']
-            url = "https://storage.googleapis.com/chromium-browser-snapshots/%s/%s/chromedriver_%s.zip" % (
-                self.chromium_platform_string(), revision, self.platform_string())
-            # Check the status without downloading the content (this is a streaming request).
-            get(url)
-        except requests.RequestException:
-            # Fall back to the tip-of-tree Chromium build.
-            revision_url = "https://storage.googleapis.com/chromium-browser-snapshots/%s/LAST_CHANGE" % (
-                self.chromium_platform_string())
-            revision = get(revision_url).text.strip()
-            url = "https://storage.googleapis.com/chromium-browser-snapshots/%s/%s/chromedriver_%s.zip" % (
-                self.chromium_platform_string(), revision, self.platform_string())
-        return url
+        if chrome_version:
+            try:
+                # Try to find the Chromium build with the same revision.
+                omaha = get("https://omahaproxy.appspot.com/deps.json?version=" + chrome_version).json()
+                revision = omaha['chromium_base_position']
+                url = "https://storage.googleapis.com/chromium-browser-snapshots/%s/%s/chromedriver_%s.zip" % (
+                    self._chromium_platform_string(), revision, self._chromedriver_platform_string())
+                # Check the status without downloading the content (this is a streaming request).
+                get(url)
+                return url
+            except requests.RequestException:
+                pass
+        # Fall back to the tip-of-tree Chromium build.
+        return "%schromedriver_%s.zip" % (self._latest_chromium_snapshot_url(), self._chromedriver_platform_string())
 
     def _latest_chromedriver_url(self, chrome_version):
         # Remove channel suffixes (e.g. " dev").
@@ -624,20 +676,33 @@ class Chrome(Browser):
                 self._chromium_chromedriver_url(chrome_version))
 
     def install_webdriver_by_version(self, version, dest=None):
-        assert version, "Cannot install ChromeDriver without Chrome version"
         if dest is None:
             dest = os.pwd
-        url = self._latest_chromedriver_url(version)
+        url = self._latest_chromedriver_url(version) if version \
+            else self._chromium_chromedriver_url(None)
         self.logger.info("Downloading ChromeDriver from %s" % url)
         unzip(get(url).raw, dest)
+
+        # The two sources of ChromeDriver have different zip structures:
+        # * Chromium archives the binary inside a chromedriver_* directory;
+        # * Chrome archives the binary directly.
+        # We want to make sure the binary always ends up directly in bin/.
         chromedriver_dir = os.path.join(
-            dest, 'chromedriver_%s' % self.platform_string())
-        if os.path.isfile(os.path.join(chromedriver_dir, "chromedriver")):
-            shutil.move(os.path.join(chromedriver_dir, "chromedriver"), dest)
-            shutil.rmtree(chromedriver_dir)
-        return find_executable("chromedriver", dest)
+            dest, 'chromedriver_%s' % self._chromedriver_platform_string())
+        binary_path = find_executable("chromedriver", chromedriver_dir)
+        if binary_path is not None:
+            shutil.move(binary_path, dest)
+            rmtree(chromedriver_dir)
+
+        binary_path = find_executable("chromedriver", dest)
+        assert binary_path is not None
+        return binary_path
 
     def install_webdriver(self, dest=None, channel=None, browser_binary=None):
+        if channel == "nightly":
+            # The "nightly" channel is not an official channel, so we simply download ToT.
+            return self.install_webdriver_by_version(None, dest)
+
         if browser_binary is None:
             browser_binary = self.find_binary(channel)
         return self.install_webdriver_by_version(
@@ -731,9 +796,9 @@ class ChromeAndroid(ChromeAndroidBase):
         return "com.android.chrome"
 
 
-#TODO(aluo): This is largely copied from the AndroidWebView implementation.
-#            Tests are not running for weblayer yet (crbug/1019521), this
-#            initial implementation will help to reproduce and debug any issues.
+# TODO(aluo): This is largely copied from the AndroidWebView implementation.
+# Tests are not running for weblayer yet (crbug/1019521), this initial
+# implementation will help to reproduce and debug any issues.
 class AndroidWeblayer(ChromeAndroidBase):
     """Weblayer-specific interface for Android."""
 
@@ -862,7 +927,7 @@ class Opera(Browser):
 
         operadriver_dir = os.path.join(dest, "operadriver_%s" % self.platform_string())
         shutil.move(os.path.join(operadriver_dir, "operadriver"), dest)
-        shutil.rmtree(operadriver_dir)
+        rmtree(operadriver_dir)
 
         path = find_executable("operadriver")
         st = os.stat(path)
@@ -959,7 +1024,7 @@ class EdgeChromium(Browser):
         driver_notes_path = os.path.join(dest, "Driver_notes")
         if os.path.isdir(driver_notes_path):
             print("Delete %s folder" % driver_notes_path)
-            shutil.rmtree(driver_notes_path, ignore_errors=False, onerror=handle_remove_readonly)
+            rmtree(driver_notes_path)
 
         self.logger.info("Downloading MSEdgeDriver from %s" % url)
         unzip(get(url).raw, dest)

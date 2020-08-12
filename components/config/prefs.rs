@@ -2,15 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::basedir::default_config_dir;
-use crate::opts;
 use embedder_traits::resources::{self, Resource};
 use serde_json::{self, Value};
 use std::borrow::ToOwned;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{stderr, Read, Write};
-use std::path::PathBuf;
 
 use crate::pref_util::Preferences;
 pub use crate::pref_util::{PrefError, PrefValue};
@@ -58,40 +53,10 @@ pub fn pref_map() -> &'static Preferences<'static, Prefs> {
     &PREFS
 }
 
-pub(crate) fn add_user_prefs() {
-    if let Some(path) = user_prefs_path() {
-        init_user_prefs(path);
+pub fn add_user_prefs(prefs: HashMap<String, PrefValue>) {
+    if let Err(error) = PREFS.set_all(prefs.into_iter()) {
+        panic!("Error setting preference: {:?}", error);
     }
-}
-
-fn user_prefs_path() -> Option<PathBuf> {
-    opts::get()
-        .config_dir
-        .clone()
-        .or_else(|| default_config_dir())
-        .map(|path| path.join("prefs.json"))
-        .filter(|path| path.exists())
-}
-
-fn init_user_prefs(path: PathBuf) {
-    if let Ok(mut file) = File::open(&path) {
-        let mut txt = String::new();
-        file.read_to_string(&mut txt)
-            .expect("Can't read user prefs");
-        match read_prefs_map(&txt) {
-            Ok(prefs) => {
-                if let Err(error) = PREFS.set_all(prefs.into_iter()) {
-                    writeln!(&mut stderr(), "Error setting preference: {:?}", error)
-                } else {
-                    Ok(())
-                }
-            },
-            Err(error) => writeln!(&mut stderr(), "Error parsing prefs.json: {:?}", error),
-        }
-    } else {
-        writeln!(&mut stderr(), "Error opening user prefs from {:?}", path)
-    }
-    .expect("failed printing to stderr");
 }
 
 pub fn read_prefs_map(txt: &str) -> Result<HashMap<String, PrefValue>, PrefError> {
@@ -158,6 +123,12 @@ mod gen {
                     },
                 },
             },
+            devtools: {
+                server: {
+                    enabled: bool,
+                    port: i64,
+                },
+            },
             dom: {
                 webgpu: {
                     enabled: bool,
@@ -168,8 +139,10 @@ mod gen {
                         enabled: bool,
                     }
                 },
+                canvas_capture: {
+                    enabled: bool,
+                },
                 canvas_text: {
-                    #[serde(rename = "dom.canvas-text.enabled")]
                     enabled: bool,
                 },
                 composition_event: {
@@ -191,6 +164,9 @@ mod gen {
                     test: bool,
                 },
                 gamepad: {
+                    enabled: bool,
+                },
+                imagebitmap: {
                     enabled: bool,
                 },
                 microdata: {
@@ -216,9 +192,15 @@ mod gen {
                         allowed_in_nonsecure_contexts: bool,
                     }
                 },
+                script: {
+                    asynch: bool,
+                },
                 serviceworker: {
                     enabled: bool,
                     timeout_seconds: i64,
+                },
+                servo_helpers: {
+                    enabled: bool,
                 },
                 servoparser: {
                     async_html_tokenizer: {
@@ -286,6 +268,9 @@ mod gen {
                     enabled: bool,
                 },
                 webrtc: {
+                    transceiver: {
+                        enabled: bool,
+                    },
                     #[serde(default)]
                     enabled: bool,
                 },
@@ -297,11 +282,16 @@ mod gen {
                     enabled: bool,
                     #[serde(default)]
                     test: bool,
+                    first_person_observer_view: bool,
                     glwindow: {
                         #[serde(default)]
                         enabled: bool,
+                        #[serde(rename = "dom.webxr.glwindow.left-right")]
+                        left_right: bool,
                         #[serde(rename = "dom.webxr.glwindow.red-cyan")]
                         red_cyan: bool,
+                        spherical: bool,
+                        cubemap: bool,
                     },
                     hands: {
                         #[serde(default)]
@@ -309,7 +299,10 @@ mod gen {
                     },
                     layers: {
                         enabled: bool,
-                    }
+                    },
+                    sessionavailable: bool,
+                    #[serde(rename = "dom.webxr.unsafe-assume-user-intent")]
+                    unsafe_assume_user_intent: bool,
                 },
                 worklet: {
                     blockingsleep: {
@@ -449,6 +442,9 @@ mod gen {
                 columns: {
                     enabled: bool,
                 },
+                flexbox: {
+                    enabled: bool,
+                },
                 #[serde(default = "default_layout_threads")]
                 threads: i64,
                 viewport: {
@@ -486,6 +482,9 @@ mod gen {
                 max_length: i64,
             },
             shell: {
+                crash_reporter: {
+                    enabled: bool,
+                },
                 homepage: String,
                 keep_screen_on: {
                     enabled: bool,

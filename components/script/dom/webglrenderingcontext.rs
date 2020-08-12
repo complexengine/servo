@@ -23,7 +23,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::element::cors_setting_for_element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::htmlcanvaselement::utils as canvas_utils;
-use crate::dom::htmlcanvaselement::HTMLCanvasElement;
+use crate::dom::htmlcanvaselement::{HTMLCanvasElement, LayoutCanvasRenderingContextHelpers};
 use crate::dom::htmliframeelement::HTMLIFrameElement;
 use crate::dom::node::{document_from_node, window_from_node, Node, NodeDamage};
 use crate::dom::promise::Promise;
@@ -58,10 +58,10 @@ use backtrace::Backtrace;
 use canvas_traits::webgl::WebGLError::*;
 use canvas_traits::webgl::{
     webgl_channel, AlphaTreatment, DOMToTextureCommand, GLContextAttributes, GLLimits, GlType,
-    Parameter, TexDataType, TexFormat, TexParameter, WebGLChan, WebGLCommand,
+    Parameter, SizedDataType, TexDataType, TexFormat, TexParameter, WebGLChan, WebGLCommand,
     WebGLCommandBacktrace, WebGLContextId, WebGLError, WebGLFramebufferBindingRequest, WebGLMsg,
-    WebGLMsgSender, WebGLOpaqueFramebufferId, WebGLProgramId, WebGLResult, WebGLSLVersion,
-    WebGLSendResult, WebGLSender, WebGLVersion, YAxisTreatment,
+    WebGLMsgSender, WebGLProgramId, WebGLResult, WebGLSLVersion, WebGLSendResult, WebGLSender,
+    WebGLVersion, YAxisTreatment,
 };
 use dom_struct::dom_struct;
 use embedder_traits::EventLoopWaker;
@@ -84,8 +84,6 @@ use std::cell::Cell;
 use std::cmp;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
-use webxr_api::SessionId;
-use webxr_api::SwapChainId as WebXRSwapChainId;
 
 // From the GLES 2.0.25 spec, page 85:
 //
@@ -257,7 +255,11 @@ impl WebGLRenderingContext {
                 // what was requested
                 size: Cell::new(size),
                 current_clear_color: Cell::new((0.0, 0.0, 0.0, 0.0)),
-                extension_manager: WebGLExtensions::new(webgl_version, ctx_data.api_type),
+                extension_manager: WebGLExtensions::new(
+                    webgl_version,
+                    ctx_data.api_type,
+                    ctx_data.glsl_version,
+                ),
                 capabilities: Default::default(),
                 default_vao: Default::default(),
                 current_vao: Default::default(),
@@ -300,6 +302,10 @@ impl WebGLRenderingContext {
 
     pub fn limits(&self) -> &GLLimits {
         &self.limits
+    }
+
+    pub fn texture_unpacking_alignment(&self) -> u32 {
+        self.texture_unpacking_alignment.get()
     }
 
     pub fn current_vao(&self) -> DomRoot<WebGLVertexArrayObjectOES> {
@@ -396,10 +402,6 @@ impl WebGLRenderingContext {
         let _ = self
             .webgl_sender
             .send(command, capture_webgl_backtrace(self));
-    }
-
-    pub fn swap_buffers(&self, id: Option<WebGLOpaqueFramebufferId>) {
-        let _ = self.webgl_sender.send_swap_buffers(id);
     }
 
     pub fn webgl_error(&self, err: WebGLError) {
@@ -531,7 +533,7 @@ impl WebGLRenderingContext {
             .dirty(NodeDamage::OtherNodeDamage);
 
         let document = document_from_node(&*self.canvas);
-        document.add_dirty_canvas(self);
+        document.add_dirty_webgl_canvas(self);
     }
 
     fn vertex_attrib(&self, indx: u32, x: f32, y: f32, z: f32, w: f32) {
@@ -605,12 +607,13 @@ impl WebGLRenderingContext {
             level,
             0,
             1,
-            TexPixels::new(
+            size,
+            TexSource::Pixels(TexPixels::new(
                 IpcSharedMemory::from_bytes(&pixels),
                 size,
                 PixelFormat::RGBA8,
                 true,
-            ),
+            )),
         );
 
         false
@@ -630,7 +633,7 @@ impl WebGLRenderingContext {
         }
     }
 
-    fn get_image_pixels(&self, source: TexImageSource) -> Fallible<Option<TexPixels>> {
+    pub fn get_image_pixels(&self, source: TexImageSource) -> Fallible<Option<TexPixels>> {
         Ok(Some(match source {
             TexImageSource::ImageData(image_data) => TexPixels::new(
                 image_data.to_shared_memory(),
@@ -693,14 +696,14 @@ impl WebGLRenderingContext {
     }
 
     // TODO(emilio): Move this logic to a validator.
-    fn validate_tex_image_2d_data(
+    pub fn validate_tex_image_2d_data(
         &self,
         width: u32,
         height: u32,
         format: TexFormat,
         data_type: TexDataType,
         unpacking_alignment: u32,
-        data: &Option<ArrayBufferView>,
+        data: Option<&ArrayBufferView>,
     ) -> Result<u32, ()> {
         let element_size = data_type.element_size();
         let components_per_element = data_type.components_per_element();
@@ -713,24 +716,13 @@ impl WebGLRenderingContext {
         // or UNSIGNED_SHORT_5_5_5_1, a Uint16Array must be supplied.
         // or FLOAT, a Float32Array must be supplied.
         // If the types do not match, an INVALID_OPERATION error is generated.
-        let is_webgl2 = self.webgl_version() == WebGLVersion::WebGL2;
-        let received_size = match *data {
-            None => element_size,
-            Some(ref buffer) => match buffer.get_array_type() {
-                Type::Uint8 => 1,
-                Type::Uint16 => 2,
-                Type::Float32 => 4,
-                Type::Int8 if is_webgl2 => 1,
-                Type::Int16 if is_webgl2 => 2,
-                Type::Int32 | Type::Uint32 if is_webgl2 => 4,
-                _ => {
-                    self.webgl_error(InvalidOperation);
-                    return Err(());
-                },
-            },
-        };
+        let data_type_matches = data.as_ref().map_or(true, |buffer| {
+            Some(data_type.sized_data_type()) ==
+                array_buffer_type_to_sized_type(buffer.get_array_type()) &&
+                data_type.required_webgl_version() <= self.webgl_version()
+        });
 
-        if received_size != element_size {
+        if !data_type_matches {
             self.webgl_error(InvalidOperation);
             return Err(());
         }
@@ -749,7 +741,7 @@ impl WebGLRenderingContext {
         }
     }
 
-    fn tex_image_2d(
+    pub fn tex_image_2d(
         &self,
         texture: &WebGLTexture,
         target: TexImageTarget,
@@ -759,15 +751,16 @@ impl WebGLRenderingContext {
         level: u32,
         _border: u32,
         unpacking_alignment: u32,
-        pixels: TexPixels,
+        size: Size2D<u32>,
+        source: TexSource,
     ) {
         // TexImage2D depth is always equal to 1.
         handle_potential_webgl_error!(
             self,
             texture.initialize(
                 target,
-                pixels.size.width,
-                pixels.size.height,
+                size.width,
+                size.height,
                 1,
                 format,
                 level,
@@ -777,12 +770,6 @@ impl WebGLRenderingContext {
 
         let settings = self.texture_unpacking_settings.get();
         let dest_premultiplied = settings.contains(TextureUnpacking::PREMULTIPLY_ALPHA);
-
-        let alpha_treatment = match (pixels.premultiplied, dest_premultiplied) {
-            (true, false) => Some(AlphaTreatment::Unmultiply),
-            (false, true) => Some(AlphaTreatment::Premultiply),
-            _ => None,
-        };
 
         let y_axis_treatment = if settings.contains(TextureUnpacking::FLIP_Y_AXIS) {
             YAxisTreatment::Flipped
@@ -798,21 +785,43 @@ impl WebGLRenderingContext {
             .extension_manager
             .effective_type(data_type.as_gl_constant());
 
-        // TODO(emilio): convert colorspace if requested.
-        self.send_command(WebGLCommand::TexImage2D {
-            target: target.as_gl_constant(),
-            level,
-            internal_format,
-            size: pixels.size,
-            format,
-            data_type,
-            effective_data_type,
-            unpacking_alignment,
-            alpha_treatment,
-            y_axis_treatment,
-            pixel_format: pixels.pixel_format,
-            data: pixels.data.into(),
-        });
+        match source {
+            TexSource::Pixels(pixels) => {
+                let alpha_treatment = match (pixels.premultiplied, dest_premultiplied) {
+                    (true, false) => Some(AlphaTreatment::Unmultiply),
+                    (false, true) => Some(AlphaTreatment::Premultiply),
+                    _ => None,
+                };
+
+                // TODO(emilio): convert colorspace if requested.
+                self.send_command(WebGLCommand::TexImage2D {
+                    target: target.as_gl_constant(),
+                    level,
+                    internal_format,
+                    size,
+                    format,
+                    data_type,
+                    effective_data_type,
+                    unpacking_alignment,
+                    alpha_treatment,
+                    y_axis_treatment,
+                    pixel_format: pixels.pixel_format,
+                    data: pixels.data.into(),
+                });
+            },
+            TexSource::BufferOffset(offset) => {
+                self.send_command(WebGLCommand::TexImage2DPBO {
+                    target: target.as_gl_constant(),
+                    level,
+                    internal_format,
+                    size,
+                    format,
+                    effective_data_type,
+                    unpacking_alignment,
+                    offset,
+                });
+            },
+        }
 
         if let Some(fb) = self.bound_draw_framebuffer.get() {
             fb.invalidate_texture(&*texture);
@@ -842,9 +851,9 @@ impl WebGLRenderingContext {
         //   - x offset plus the width is greater than the texture width
         //   - y offset plus the height is greater than the texture height
         if xoffset < 0 ||
-            (xoffset as u32 + pixels.size.width) > image_info.width() ||
+            (xoffset as u32 + pixels.size().width) > image_info.width() ||
             yoffset < 0 ||
-            (yoffset as u32 + pixels.size.height) > image_info.height()
+            (yoffset as u32 + pixels.size().height) > image_info.height()
         {
             return self.webgl_error(InvalidValue);
         }
@@ -887,7 +896,7 @@ impl WebGLRenderingContext {
             level,
             xoffset,
             yoffset,
-            size: pixels.size,
+            size: pixels.size(),
             format,
             data_type,
             effective_data_type,
@@ -2310,6 +2319,11 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         })
     }
 
+    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.13
+    fn IsContextLost(&self) -> bool {
+        false
+    }
+
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.14
     fn GetSupportedExtensions(&self) -> Option<Vec<DOMString>> {
         self.extension_manager
@@ -3549,7 +3563,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn IsTexture(&self, texture: Option<&WebGLTexture>) -> bool {
         texture.map_or(false, |tex| {
-            self.validate_ownership(tex).is_ok() && tex.target().is_some() && !tex.is_deleted()
+            self.validate_ownership(tex).is_ok() && tex.target().is_some() && !tex.is_invalid()
         })
     }
 
@@ -4283,7 +4297,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 format,
                 data_type,
                 unpacking_alignment,
-                &*pixels,
+                pixels.as_ref(),
             )
         } {
             Ok(byte_length) => byte_length,
@@ -4322,6 +4336,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             return Ok(());
         }
 
+        let size = Size2D::new(width, height);
+
         self.tex_image_2d(
             &texture,
             target,
@@ -4331,7 +4347,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             level,
             border,
             unpacking_alignment,
-            TexPixels::from_array(buff, Size2D::new(width, height)),
+            size,
+            TexSource::Pixels(TexPixels::from_array(buff, size)),
         );
 
         Ok(())
@@ -4361,8 +4378,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             target,
             level,
             internal_format as u32,
-            pixels.size.width as i32,
-            pixels.size.height as i32,
+            pixels.size().width as i32,
+            pixels.size().height as i32,
             0,
             format,
             data_type,
@@ -4394,7 +4411,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             target,
             level,
             internal_format,
-            pixels.size,
+            pixels.size(),
             data_type,
         ) {
             // FIXME(nox): What is the spec for this? No error is emitted ever
@@ -4411,7 +4428,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             level,
             border,
             1,
-            pixels,
+            pixels.size(),
+            TexSource::Pixels(pixels),
         );
         Ok(())
     }
@@ -4510,7 +4528,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 format,
                 data_type,
                 unpacking_alignment,
-                &*pixels,
+                pixels.as_ref(),
             )
         } {
             Ok(byte_length) => byte_length,
@@ -4571,8 +4589,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             target,
             level,
             format,
-            pixels.size.width as i32,
-            pixels.size.height as i32,
+            pixels.size().width as i32,
+            pixels.size().height as i32,
             0,
             format,
             data_type,
@@ -4700,12 +4718,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 }
 
-pub trait LayoutCanvasWebGLRenderingContextHelpers {
-    #[allow(unsafe_code)]
-    unsafe fn canvas_data_source(self) -> HTMLCanvasDataSource;
-}
-
-impl LayoutCanvasWebGLRenderingContextHelpers for LayoutDom<'_, WebGLRenderingContext> {
+impl LayoutCanvasRenderingContextHelpers for LayoutDom<'_, WebGLRenderingContext> {
     #[allow(unsafe_code)]
     unsafe fn canvas_data_source(self) -> HTMLCanvasDataSource {
         (*self.unsafe_get()).layout_handle()
@@ -4888,7 +4901,7 @@ impl TextureUnit {
     }
 }
 
-struct TexPixels {
+pub struct TexPixels {
     data: IpcSharedMemory,
     size: Size2D<u32>,
     pixel_format: Option<PixelFormat>,
@@ -4910,7 +4923,7 @@ impl TexPixels {
         }
     }
 
-    fn from_array(data: IpcSharedMemory, size: Size2D<u32>) -> Self {
+    pub fn from_array(data: IpcSharedMemory, size: Size2D<u32>) -> Self {
         Self {
             data,
             size,
@@ -4918,6 +4931,15 @@ impl TexPixels {
             premultiplied: false,
         }
     }
+
+    pub fn size(&self) -> Size2D<u32> {
+        self.size
+    }
+}
+
+pub enum TexSource {
+    Pixels(TexPixels),
+    BufferOffset(i64),
 }
 
 #[derive(JSTraceable)]
@@ -4980,19 +5002,6 @@ impl WebGLMessageSender {
         self.wake_after_send(|| self.sender.send(msg, backtrace))
     }
 
-    pub fn send_swap_buffers(&self, id: Option<WebGLOpaqueFramebufferId>) -> WebGLSendResult {
-        self.wake_after_send(|| self.sender.send_swap_buffers(id))
-    }
-
-    pub fn send_create_webxr_swap_chain(
-        &self,
-        size: Size2D<i32>,
-        sender: WebGLSender<Option<WebXRSwapChainId>>,
-        id: SessionId,
-    ) -> WebGLSendResult {
-        self.wake_after_send(|| self.sender.send_create_webxr_swap_chain(size, sender, id))
-    }
-
     pub fn send_resize(
         &self,
         size: Size2D<u32>,
@@ -5017,5 +5026,22 @@ pub trait Size2DExt {
 impl Size2DExt for Size2D<u32> {
     fn to_u64(&self) -> Size2D<u64> {
         return Size2D::new(self.width as u64, self.height as u64);
+    }
+}
+
+fn array_buffer_type_to_sized_type(type_: Type) -> Option<SizedDataType> {
+    match type_ {
+        Type::Uint8 | Type::Uint8Clamped => Some(SizedDataType::Uint8),
+        Type::Uint16 => Some(SizedDataType::Uint16),
+        Type::Uint32 => Some(SizedDataType::Uint32),
+        Type::Int8 => Some(SizedDataType::Int8),
+        Type::Int16 => Some(SizedDataType::Int16),
+        Type::Int32 => Some(SizedDataType::Int32),
+        Type::Float32 => Some(SizedDataType::Float32),
+        Type::Float64 |
+        Type::BigInt64 |
+        Type::BigUint64 |
+        Type::MaxTypedArrayViewType |
+        Type::Int64 => None,
     }
 }

@@ -2,11 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::response::HttpsState;
 use crate::ReferrerPolicy;
 use crate::ResourceTimingType;
 use content_security_policy::{self as csp, CspList};
 use http::HeaderMap;
 use hyper::Method;
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use mime::Mime;
 use msg::constellation_msg::PipelineId;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -35,8 +37,12 @@ pub enum Origin {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum Referrer {
     NoReferrer,
-    /// Default referrer if nothing is specified
-    Client,
+    /// Contains the url that "client" would be resolved to. See
+    /// [https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer](https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer)
+    ///
+    /// If you are unsure you should probably use
+    /// [`GlobalScope::get_referrer`](https://doc.servo.org/script/dom/globalscope/struct.GlobalScope.html#method.get_referrer)
+    Client(ServoUrl),
     ReferrerUrl(ServoUrl),
 }
 
@@ -114,6 +120,93 @@ pub enum ParserMetadata {
     NotParserInserted,
 }
 
+/// <https://fetch.spec.whatwg.org/#concept-body-source>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum BodySource {
+    Null,
+    Object,
+}
+
+/// Messages used to implement <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
+/// which are sent from script to net.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum BodyChunkResponse {
+    /// A chunk of bytes.
+    Chunk(Vec<u8>),
+    /// The body is done.
+    Done,
+    /// There was an error streaming the body,
+    /// terminate fetch.
+    Error,
+}
+
+/// Messages used to implement <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
+/// which are sent from net to script
+/// (with the exception of Done, which is sent from script to script).
+#[derive(Debug, Deserialize, Serialize)]
+pub enum BodyChunkRequest {
+    /// Connect a fetch in `net`, with a stream of bytes from `script`.
+    Connect(IpcSender<BodyChunkResponse>),
+    /// Re-extract a new stream from the source, following a redirect.
+    Extract(IpcReceiver<BodyChunkRequest>),
+    /// Ask for another chunk.
+    Chunk,
+    /// Signal the stream is done(sent from script to script).
+    Done,
+    /// Signal the stream has errored(sent from script to script).
+    Error,
+}
+
+/// The net component's view into <https://fetch.spec.whatwg.org/#bodies>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct RequestBody {
+    /// Net's channel to communicate with script re this body.
+    #[ignore_malloc_size_of = "Channels are hard"]
+    chan: IpcSender<BodyChunkRequest>,
+    /// <https://fetch.spec.whatwg.org/#concept-body-source>
+    source: BodySource,
+    /// <https://fetch.spec.whatwg.org/#concept-body-total-bytes>
+    total_bytes: Option<usize>,
+}
+
+impl RequestBody {
+    pub fn new(
+        chan: IpcSender<BodyChunkRequest>,
+        source: BodySource,
+        total_bytes: Option<usize>,
+    ) -> Self {
+        RequestBody {
+            chan,
+            source,
+            total_bytes,
+        }
+    }
+
+    /// Step 12 of https://fetch.spec.whatwg.org/#concept-http-redirect-fetch
+    pub fn extract_source(&mut self) {
+        match self.source {
+            BodySource::Null => panic!("Null sources should never be re-directed."),
+            BodySource::Object => {
+                let (chan, port) = ipc::channel().unwrap();
+                let _ = self.chan.send(BodyChunkRequest::Extract(port));
+                self.chan = chan.clone();
+            },
+        }
+    }
+
+    pub fn take_stream(&self) -> IpcSender<BodyChunkRequest> {
+        self.chan.clone()
+    }
+
+    pub fn source_is_null(&self) -> bool {
+        self.source == BodySource::Null
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        self.total_bytes.clone()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct RequestBuilder {
     #[serde(
@@ -130,7 +223,7 @@ pub struct RequestBuilder {
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
     pub unsafe_request: bool,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<RequestBody>,
     pub service_workers_mode: ServiceWorkersMode,
     // TODO: client object
     pub destination: Destination,
@@ -142,7 +235,7 @@ pub struct RequestBuilder {
     pub use_url_credentials: bool,
     pub origin: ImmutableOrigin,
     // XXXManishearth these should be part of the client object
-    pub referrer: Option<Referrer>,
+    pub referrer: Referrer,
     pub referrer_policy: Option<ReferrerPolicy>,
     pub pipeline_id: Option<PipelineId>,
     pub redirect_mode: RedirectMode,
@@ -156,10 +249,11 @@ pub struct RequestBuilder {
     pub url_list: Vec<ServoUrl>,
     pub parser_metadata: ParserMetadata,
     pub initiator: Initiator,
+    pub https_state: HttpsState,
 }
 
 impl RequestBuilder {
-    pub fn new(url: ServoUrl) -> RequestBuilder {
+    pub fn new(url: ServoUrl, referrer: Referrer) -> RequestBuilder {
         RequestBuilder {
             method: Method::GET,
             url: url,
@@ -175,7 +269,7 @@ impl RequestBuilder {
             credentials_mode: CredentialsMode::Omit,
             use_url_credentials: false,
             origin: ImmutableOrigin::new_opaque(),
-            referrer: None,
+            referrer: referrer,
             referrer_policy: None,
             pipeline_id: None,
             redirect_mode: RedirectMode::Follow,
@@ -184,6 +278,7 @@ impl RequestBuilder {
             parser_metadata: ParserMetadata::Default,
             initiator: Initiator::None,
             csp_list: None,
+            https_state: HttpsState::None,
         }
     }
 
@@ -207,7 +302,7 @@ impl RequestBuilder {
         self
     }
 
-    pub fn body(mut self, body: Option<Vec<u8>>) -> RequestBuilder {
+    pub fn body(mut self, body: Option<RequestBody>) -> RequestBuilder {
         self.body = body;
         self
     }
@@ -247,11 +342,6 @@ impl RequestBuilder {
         self
     }
 
-    pub fn referrer(mut self, referrer: Option<Referrer>) -> RequestBuilder {
-        self.referrer = referrer;
-        self
-    }
-
     pub fn referrer_policy(mut self, referrer_policy: Option<ReferrerPolicy>) -> RequestBuilder {
         self.referrer_policy = referrer_policy;
         self
@@ -277,11 +367,18 @@ impl RequestBuilder {
         self
     }
 
+    pub fn https_state(mut self, https_state: HttpsState) -> RequestBuilder {
+        self.https_state = https_state;
+        self
+    }
+
     pub fn build(self) -> Request {
         let mut request = Request::new(
             self.url.clone(),
             Some(Origin::Origin(self.origin)),
+            self.referrer,
             self.pipeline_id,
+            self.https_state,
         );
         request.initiator = self.initiator;
         request.method = self.method;
@@ -296,7 +393,6 @@ impl RequestBuilder {
         request.credentials_mode = self.credentials_mode;
         request.use_url_credentials = self.use_url_credentials;
         request.cache_mode = self.cache_mode;
-        request.referrer = self.referrer.unwrap_or(Referrer::Client);
         request.referrer_policy = self.referrer_policy;
         request.redirect_mode = self.redirect_mode;
         let mut url_list = self.url_list;
@@ -329,7 +425,7 @@ pub struct Request {
     /// <https://fetch.spec.whatwg.org/#unsafe-request-flag>
     pub unsafe_request: bool,
     /// <https://fetch.spec.whatwg.org/#concept-request-body>
-    pub body: Option<Vec<u8>>,
+    pub body: Option<RequestBody>,
     // TODO: client object
     pub window: Window,
     // TODO: target browsing context
@@ -380,10 +476,17 @@ pub struct Request {
     // boundary every time a redirect occurs.
     #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
     pub csp_list: Option<CspList>,
+    pub https_state: HttpsState,
 }
 
 impl Request {
-    pub fn new(url: ServoUrl, origin: Option<Origin>, pipeline_id: Option<PipelineId>) -> Request {
+    pub fn new(
+        url: ServoUrl,
+        origin: Option<Origin>,
+        referrer: Referrer,
+        pipeline_id: Option<PipelineId>,
+        https_state: HttpsState,
+    ) -> Request {
         Request {
             method: Method::GET,
             local_urls_only: false,
@@ -397,7 +500,7 @@ impl Request {
             initiator: Initiator::None,
             destination: Destination::None,
             origin: origin.unwrap_or(Origin::Client),
-            referrer: Referrer::Client,
+            referrer: referrer,
             referrer_policy: None,
             pipeline_id: pipeline_id,
             synchronous: false,
@@ -413,6 +516,7 @@ impl Request {
             redirect_count: 0,
             response_tainting: ResponseTainting::Basic,
             csp_list: None,
+            https_state: https_state,
         }
     }
 
@@ -465,7 +569,8 @@ impl Request {
 impl Referrer {
     pub fn to_url(&self) -> Option<&ServoUrl> {
         match *self {
-            Referrer::NoReferrer | Referrer::Client => None,
+            Referrer::NoReferrer => None,
+            Referrer::Client(ref url) => Some(url),
             Referrer::ReferrerUrl(ref url) => Some(url),
         }
     }

@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 
 #[macro_use]
+extern crate bitflags;
+#[macro_use]
 extern crate malloc_size_of;
 #[macro_use]
 extern crate malloc_size_of_derive;
@@ -47,7 +49,7 @@ use msg::constellation_msg::{
 use msg::constellation_msg::{PipelineNamespaceId, TopLevelBrowsingContextId};
 use net_traits::image::base::Image;
 use net_traits::image_cache::ImageCache;
-use net_traits::request::Referrer;
+use net_traits::request::{Referrer, RequestBody};
 use net_traits::storage_thread::StorageType;
 use net_traits::{FetchResponseMsg, ReferrerPolicy, ResourceThreads};
 use pixels::PixelFormat;
@@ -64,15 +66,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use style_traits::CSSPixel;
 use style_traits::SpeculativePainter;
+use webgpu::identity::WebGPUMsg;
 use webrender_api::units::{
     DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutSize, WorldPoint,
 };
-use webrender_api::{BuiltDisplayList, DocumentId, ExternalScrollId, ImageKey, ScrollClamping};
-use webrender_api::{BuiltDisplayListDescriptor, HitTestFlags, HitTestResult, ResourceUpdate};
+use webrender_api::{
+    BuiltDisplayList, DocumentId, ExternalScrollId, ImageData, ImageDescriptor, ImageKey,
+    ScrollClamping,
+};
+use webrender_api::{BuiltDisplayListDescriptor, HitTestFlags, HitTestResult};
 
 pub use crate::script_msg::{
-    DOMMessage, HistoryEntryReplacement, SWManagerMsg, SWManagerSenders, ScopeThings,
-    ServiceWorkerMsg,
+    DOMMessage, HistoryEntryReplacement, Job, JobError, JobResult, JobResultValue, JobType,
+    SWManagerMsg, SWManagerSenders, ScopeThings, ServiceWorkerMsg,
 };
 pub use crate::script_msg::{
     EventResult, IFrameSize, IFrameSizeMsg, LayoutMsg, LogEntry, ScriptMsg,
@@ -122,8 +128,6 @@ pub enum LayoutControlMsg {
     ExitNow,
     /// Requests the current epoch (layout counter) from this layout.
     GetCurrentEpoch(IpcSender<Epoch>),
-    /// Asks layout to run another step in its animation.
-    TickAnimations(ImmutableOrigin),
     /// Tells layout about the new scrolling offsets of each scrollable stacking context.
     SetScrollStates(Vec<ScrollState>),
     /// Requests the current load state of Web fonts. `true` is returned if fonts are still loading
@@ -167,12 +171,12 @@ pub struct LoadData {
         serialize_with = "::hyper_serde::serialize"
     )]
     pub headers: HeaderMap,
-    /// The data.
-    pub data: Option<Vec<u8>>,
+    /// The data that will be used as the body of the request.
+    pub data: Option<RequestBody>,
     /// The result of evaluating a javascript scheme url.
     pub js_eval_result: Option<JsEvalResult>,
     /// The referrer.
-    pub referrer: Option<Referrer>,
+    pub referrer: Referrer,
     /// The referrer policy.
     pub referrer_policy: Option<ReferrerPolicy>,
 
@@ -196,7 +200,7 @@ impl LoadData {
         load_origin: LoadOrigin,
         url: ServoUrl,
         creator_pipeline_id: Option<PipelineId>,
-        referrer: Option<Referrer>,
+        referrer: Referrer,
         referrer_policy: Option<ReferrerPolicy>,
     ) -> LoadData {
         LoadData {
@@ -280,42 +284,6 @@ pub enum UpdatePipelineIdReason {
     Navigation,
     /// The pipeline id is being updated due to a history traversal.
     Traversal,
-}
-
-/// The type of transition event to trigger. These are defined by
-/// CSS Transitions § 6.1 and CSS Animations § 4.2
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum TransitionOrAnimationEventType {
-    /// "The transitionrun event occurs when a transition is created (i.e., when it
-    /// is added to the set of running transitions)."
-    TransitionRun,
-    /// "The transitionend event occurs at the completion of the transition. In the
-    /// case where a transition is removed before completion, such as if the
-    /// transition-property is removed, then the event will not fire."
-    TransitionEnd,
-    /// "The transitioncancel event occurs when a transition is canceled."
-    TransitionCancel,
-    /// "The animationend event occurs when the animation finishes"
-    AnimationEnd,
-}
-
-impl TransitionOrAnimationEventType {
-    /// Whether or not this event finalizes the animation or transition. During finalization
-    /// the DOM object associated with this transition or animation is unrooted.
-    pub fn finalizes_transition_or_animation(&self) -> bool {
-        match *self {
-            Self::TransitionEnd | Self::TransitionCancel | Self::AnimationEnd => true,
-            Self::TransitionRun => false,
-        }
-    }
-
-    /// Whether or not this event is a transition-related event.
-    pub fn is_transition_event(&self) -> bool {
-        match *self {
-            Self::TransitionRun | Self::TransitionEnd | Self::TransitionCancel => true,
-            Self::AnimationEnd => false,
-        }
-    }
 }
 
 /// Messages sent from the constellation or layout to the script thread.
@@ -403,21 +371,7 @@ pub enum ConstellationControlMsg {
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(PipelineId),
-    /// Notifies the script thread that a transition or animation related event should be sent.
-    TransitionOrAnimationEvent {
-        /// The pipeline id of the layout task that sent this message.
-        pipeline_id: PipelineId,
-        /// The type of transition event this should trigger.
-        event_type: TransitionOrAnimationEventType,
-        /// The address of the node which owns this transition.
-        node: UntrustedNodeAddress,
-        /// The name of the property that is transitioning (in the case of a transition)
-        /// or the name of the animation (in the case of an animation).
-        property_or_animation_name: String,
-        /// The elapsed time property to send with this transition event.
-        elapsed_time: f64,
-    },
+    TickAllAnimations(PipelineId, AnimationTickType),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId),
@@ -448,6 +402,8 @@ pub enum ConstellationControlMsg {
     PaintMetric(PipelineId, ProgressiveWebMetricType, u64),
     /// Notifies the media session about a user requested media session action.
     MediaSessionAction(PipelineId, MediaSessionActionType),
+    /// Notifies script thread that WebGPU server has started
+    SetWebGPUPort(IpcReceiver<WebGPUMsg>),
 }
 
 impl fmt::Debug for ConstellationControlMsg {
@@ -477,7 +433,6 @@ impl fmt::Debug for ConstellationControlMsg {
             FocusIFrame(..) => "FocusIFrame",
             WebDriverScriptCommand(..) => "WebDriverScriptCommand",
             TickAllAnimations(..) => "TickAllAnimations",
-            TransitionOrAnimationEvent { .. } => "TransitionOrAnimationEvent",
             WebFontLoaded(..) => "WebFontLoaded",
             DispatchIFrameLoadEvent { .. } => "DispatchIFrameLoadEvent",
             DispatchStorageEvent(..) => "DispatchStorageEvent",
@@ -486,6 +441,7 @@ impl fmt::Debug for ConstellationControlMsg {
             PaintMetric(..) => "PaintMetric",
             ExitFullScreen(..) => "ExitFullScreen",
             MediaSessionAction(..) => "MediaSessionAction",
+            SetWebGPUPort(..) => "SetWebGPUPort",
         };
         write!(formatter, "ConstellationControlMsg::{}", variant)
     }
@@ -596,7 +552,7 @@ pub enum CompositorEvent {
     ),
     /// The mouse was moved over a point (or was moved out of the recognizable region).
     MouseMoveEvent(
-        Option<Point2D<f32>>,
+        Point2D<f32>,
         Option<UntrustedNodeAddress>,
         // Bitmask of MouseButton values representing the currently pressed buttons
         u16,
@@ -614,6 +570,8 @@ pub enum CompositorEvent {
     KeyboardEvent(KeyboardEvent),
     /// An event from the IME is dispatched.
     CompositionEvent(CompositionEvent),
+    /// Virtual keyboard was dismissed
+    IMEDismissedEvent,
 }
 
 /// Requests a TimerEvent-Message be sent after the given duration.
@@ -688,7 +646,7 @@ pub struct InitialScriptState {
     /// A channel on which messages can be sent to the constellation from script.
     pub script_to_constellation_chan: ScriptToConstellationChan,
     /// A handle to register script-(and associated layout-)threads for hang monitoring.
-    pub background_hang_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
+    pub background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     /// A sender for the layout thread to communicate to the constellation.
     pub layout_to_constellation_chan: IpcSender<LayoutMsg>,
     /// A channel to schedule timer events.
@@ -741,6 +699,7 @@ pub trait ScriptThreadFactory {
         relayout_event: bool,
         prepare_for_screenshot: bool,
         unminify_js: bool,
+        local_script_source: Option<String>,
         userscripts_path: Option<String>,
         headless: bool,
         replace_surrogates: bool,
@@ -812,13 +771,15 @@ pub struct IFrameLoadInfoWithData {
     pub window_size: WindowSizeData,
 }
 
-/// Specifies whether the script or layout thread needs to be ticked for animation.
-#[derive(Debug, Deserialize, Serialize)]
-pub enum AnimationTickType {
-    /// The script thread.
-    Script,
-    /// The layout thread.
-    Layout,
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    /// Specifies if rAF should be triggered and/or CSS Animations and Transitions.
+    pub struct AnimationTickType: u8 {
+        /// Trigger a call to requestAnimationFrame.
+        const REQUEST_ANIMATION_FRAME = 0b001;
+        /// Trigger restyles for CSS Animations and Transitions.
+        const CSS_ANIMATIONS_AND_TRANSITIONS = 0b010;
+    }
 }
 
 /// The scroll state of a stacking context.
@@ -1141,12 +1102,11 @@ impl From<i32> for MediaSessionActionType {
 #[derive(Deserialize, Serialize)]
 pub enum WebrenderMsg {
     /// Inform WebRender of the existence of this pipeline.
-    SendInitialTransaction(DocumentId, webrender_api::PipelineId),
+    SendInitialTransaction(webrender_api::PipelineId),
     /// Perform a scroll operation.
-    SendScrollNode(DocumentId, LayoutPoint, ExternalScrollId, ScrollClamping),
+    SendScrollNode(LayoutPoint, ExternalScrollId, ScrollClamping),
     /// Inform WebRender of a new display list for the given pipeline.
     SendDisplayList(
-        DocumentId,
         webrender_api::Epoch,
         LayoutSize,
         webrender_api::PipelineId,
@@ -1157,7 +1117,6 @@ pub enum WebrenderMsg {
     /// Perform a hit test operation. The result will be returned via
     /// the provided channel sender.
     HitTest(
-        DocumentId,
         Option<webrender_api::PipelineId>,
         WorldPoint,
         HitTestFlags,
@@ -1167,7 +1126,7 @@ pub enum WebrenderMsg {
     /// provided channel sender.
     GenerateImageKey(IpcSender<ImageKey>),
     /// Perform a resource update operation.
-    UpdateResources(Vec<ResourceUpdate>),
+    UpdateImages(Vec<ImageUpdate>),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1181,15 +1140,8 @@ impl WebrenderIpcSender {
     }
 
     /// Inform WebRender of the existence of this pipeline.
-    pub fn send_initial_transaction(
-        &self,
-        document: DocumentId,
-        pipeline: webrender_api::PipelineId,
-    ) {
-        if let Err(e) = self
-            .0
-            .send(WebrenderMsg::SendInitialTransaction(document, pipeline))
-        {
+    pub fn send_initial_transaction(&self, pipeline: webrender_api::PipelineId) {
+        if let Err(e) = self.0.send(WebrenderMsg::SendInitialTransaction(pipeline)) {
             warn!("Error sending initial transaction: {}", e);
         }
     }
@@ -1197,14 +1149,14 @@ impl WebrenderIpcSender {
     /// Perform a scroll operation.
     pub fn send_scroll_node(
         &self,
-        document: DocumentId,
         point: LayoutPoint,
         scroll_id: ExternalScrollId,
         clamping: ScrollClamping,
     ) {
-        if let Err(e) = self.0.send(WebrenderMsg::SendScrollNode(
-            document, point, scroll_id, clamping,
-        )) {
+        if let Err(e) = self
+            .0
+            .send(WebrenderMsg::SendScrollNode(point, scroll_id, clamping))
+        {
             warn!("Error sending scroll node: {}", e);
         }
     }
@@ -1212,14 +1164,12 @@ impl WebrenderIpcSender {
     /// Inform WebRender of a new display list for the given pipeline.
     pub fn send_display_list(
         &self,
-        document: DocumentId,
         epoch: Epoch,
         size: LayoutSize,
         (pipeline, size2, list): (webrender_api::PipelineId, LayoutSize, BuiltDisplayList),
     ) {
         let (data, descriptor) = list.into_data();
         if let Err(e) = self.0.send(WebrenderMsg::SendDisplayList(
-            document,
             webrender_api::Epoch(epoch.0),
             size,
             pipeline,
@@ -1235,33 +1185,41 @@ impl WebrenderIpcSender {
     /// and a result is available.
     pub fn hit_test(
         &self,
-        document: DocumentId,
         pipeline: Option<webrender_api::PipelineId>,
         point: WorldPoint,
         flags: HitTestFlags,
     ) -> HitTestResult {
         let (sender, receiver) = ipc::channel().unwrap();
         self.0
-            .send(WebrenderMsg::HitTest(
-                document, pipeline, point, flags, sender,
-            ))
+            .send(WebrenderMsg::HitTest(pipeline, point, flags, sender))
             .expect("error sending hit test");
         receiver.recv().expect("error receiving hit test result")
     }
 
     /// Create a new image key. Blocks until the key is available.
-    pub fn generate_image_key(&self) -> ImageKey {
+    pub fn generate_image_key(&self) -> Result<ImageKey, ()> {
         let (sender, receiver) = ipc::channel().unwrap();
         self.0
             .send(WebrenderMsg::GenerateImageKey(sender))
-            .expect("error sending image key generation");
-        receiver.recv().expect("error receiving image key result")
+            .map_err(|_| ())?;
+        receiver.recv().map_err(|_| ())
     }
 
     /// Perform a resource update operation.
-    pub fn update_resources(&self, updates: Vec<ResourceUpdate>) {
-        if let Err(e) = self.0.send(WebrenderMsg::UpdateResources(updates)) {
-            warn!("error sending resource updates: {}", e);
+    pub fn update_images(&self, updates: Vec<ImageUpdate>) {
+        if let Err(e) = self.0.send(WebrenderMsg::UpdateImages(updates)) {
+            warn!("error sending image updates: {}", e);
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+/// Serializable image updates that must be performed by WebRender.
+pub enum ImageUpdate {
+    /// Register a new image.
+    AddImage(ImageKey, ImageDescriptor, ImageData),
+    /// Delete a previously registered image registration.
+    DeleteImage(ImageKey),
+    /// Update an existing image registration.
+    UpdateImage(ImageKey, ImageDescriptor, ImageData),
 }

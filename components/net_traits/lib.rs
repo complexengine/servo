@@ -30,9 +30,10 @@ use ipc_channel::router::ROUTER;
 use ipc_channel::Error as IpcError;
 use mime::Mime;
 use msg::constellation_msg::HistoryStateId;
+use servo_rand::RngCore;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use time::precise_time_ns;
-use webrender_api::ImageKey;
+use webrender_api::{ImageData, ImageDescriptor, ImageKey};
 
 pub mod blob_url_store;
 pub mod filemanager_thread;
@@ -126,6 +127,22 @@ pub enum ReferrerPolicy {
     StrictOriginWhenCrossOrigin,
 }
 
+impl ToString for ReferrerPolicy {
+    fn to_string(&self) -> String {
+        match self {
+            ReferrerPolicy::NoReferrer => "no-referrer",
+            ReferrerPolicy::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            ReferrerPolicy::Origin => "origin",
+            ReferrerPolicy::SameOrigin => "same-origin",
+            ReferrerPolicy::OriginWhenCrossOrigin => "origin-when-cross-origin",
+            ReferrerPolicy::UnsafeUrl => "unsafe-url",
+            ReferrerPolicy::StrictOrigin => "strict-origin",
+            ReferrerPolicy::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+        }
+        .to_string()
+    }
+}
+
 impl From<ReferrerPolicyHeader> for ReferrerPolicy {
     fn from(policy: ReferrerPolicyHeader) -> Self {
         match policy {
@@ -140,6 +157,25 @@ impl From<ReferrerPolicyHeader> for ReferrerPolicy {
             ReferrerPolicyHeader::STRICT_ORIGIN => ReferrerPolicy::StrictOrigin,
             ReferrerPolicyHeader::STRICT_ORIGIN_WHEN_CROSS_ORIGIN => {
                 ReferrerPolicy::StrictOriginWhenCrossOrigin
+            },
+        }
+    }
+}
+
+impl From<ReferrerPolicy> for ReferrerPolicyHeader {
+    fn from(referrer_policy: ReferrerPolicy) -> Self {
+        match referrer_policy {
+            ReferrerPolicy::NoReferrer => ReferrerPolicyHeader::NO_REFERRER,
+            ReferrerPolicy::NoReferrerWhenDowngrade => {
+                ReferrerPolicyHeader::NO_REFERRER_WHEN_DOWNGRADE
+            },
+            ReferrerPolicy::SameOrigin => ReferrerPolicyHeader::SAME_ORIGIN,
+            ReferrerPolicy::Origin => ReferrerPolicyHeader::ORIGIN,
+            ReferrerPolicy::OriginWhenCrossOrigin => ReferrerPolicyHeader::ORIGIN_WHEN_CROSS_ORIGIN,
+            ReferrerPolicy::UnsafeUrl => ReferrerPolicyHeader::UNSAFE_URL,
+            ReferrerPolicy::StrictOrigin => ReferrerPolicyHeader::STRICT_ORIGIN,
+            ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+                ReferrerPolicyHeader::STRICT_ORIGIN_WHEN_CROSS_ORIGIN
             },
         }
     }
@@ -186,7 +222,7 @@ pub enum FilteredMetadata {
     Basic(Metadata),
     Cors(Metadata),
     Opaque,
-    OpaqueRedirect,
+    OpaqueRedirect(ServoUrl),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -325,6 +361,10 @@ impl ResourceThreads {
             storage_thread: s,
         }
     }
+
+    pub fn clear_cache(&self) {
+        let _ = self.core_thread.send(CoreResourceMsg::ClearCache);
+    }
 }
 
 impl IpcSend<CoreResourceMsg> for ResourceThreads {
@@ -423,6 +463,8 @@ pub enum CoreResourceMsg {
     RemoveHistoryStates(Vec<HistoryStateId>),
     /// Synchronization message solely for knowing the state of the ResourceChannelManager loop
     Synchronize(IpcSender<()>),
+    /// Clear the network cache.
+    ClearCache,
     /// Send the service worker network mediator for an origin to CoreResourceThread
     NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler
@@ -638,6 +680,8 @@ pub struct Metadata {
     pub referrer_policy: Option<ReferrerPolicy>,
     /// Performance information for navigation events
     pub timing: Option<ResourceFetchTiming>,
+    /// True if the request comes from a redirection
+    pub redirected: bool,
 }
 
 impl Metadata {
@@ -655,6 +699,7 @@ impl Metadata {
             referrer: None,
             referrer_policy: None,
             timing: None,
+            redirected: false,
         }
     }
 
@@ -675,6 +720,21 @@ impl Metadata {
             self.content_type = Some(Serde(ContentType::from(mime.clone())));
         }
     }
+
+    /// Set the referrer policy associated with the loaded resource.
+    pub fn set_referrer_policy(&mut self, referrer_policy: Option<ReferrerPolicy>) {
+        if self.headers.is_none() {
+            self.headers = Some(Serde(HeaderMap::new()));
+        }
+
+        self.referrer_policy = referrer_policy;
+        if let Some(referrer_policy) = referrer_policy {
+            self.headers
+                .as_mut()
+                .unwrap()
+                .typed_insert::<ReferrerPolicyHeader>(referrer_policy.into());
+        }
+    }
 }
 
 /// The creator of a given cookie
@@ -693,12 +753,17 @@ pub enum NetworkError {
     Internal(String),
     LoadCancelled,
     /// SSL validation error that has to be handled in the HTML parser
-    SslValidation(ServoUrl, String),
+    SslValidation(String, Vec<u8>),
 }
 
 impl NetworkError {
-    pub fn from_hyper_error(error: &HyperError) -> Self {
-        NetworkError::Internal(error.to_string())
+    pub fn from_hyper_error(error: &HyperError, cert_bytes: Option<Vec<u8>>) -> Self {
+        let s = error.to_string();
+        if s.contains("the handshake failed") {
+            NetworkError::SslValidation(s, cert_bytes.unwrap_or_default())
+        } else {
+            NetworkError::Internal(s)
+        }
     }
 
     pub fn from_http_error(error: &HttpError) -> Self {
@@ -758,7 +823,7 @@ pub fn http_percent_encode(bytes: &[u8]) -> String {
 
 #[derive(Deserialize, Serialize)]
 pub enum WebrenderImageMsg {
-    UpdateResources(Vec<webrender_api::ResourceUpdate>),
+    AddImage(ImageKey, ImageDescriptor, ImageData),
     GenerateImageKey(IpcSender<ImageKey>),
 }
 
@@ -778,9 +843,16 @@ impl WebrenderIpcSender {
         receiver.recv().expect("error receiving image key result")
     }
 
-    pub fn update_resources(&self, updates: Vec<webrender_api::ResourceUpdate>) {
-        if let Err(e) = self.0.send(WebrenderImageMsg::UpdateResources(updates)) {
+    pub fn add_image(&self, key: ImageKey, descriptor: ImageDescriptor, data: ImageData) {
+        if let Err(e) = self
+            .0
+            .send(WebrenderImageMsg::AddImage(key, descriptor, data))
+        {
             warn!("Error sending image update: {}", e);
         }
     }
+}
+
+lazy_static! {
+    pub static ref PRIVILEGED_SECRET: u32 = servo_rand::ServoRng::new().next_u32();
 }

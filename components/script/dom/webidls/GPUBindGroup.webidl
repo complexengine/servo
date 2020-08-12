@@ -3,22 +3,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // https://gpuweb.github.io/gpuweb/#gpubindgrouplayout
-[Exposed=(Window, DedicatedWorker), Serializable, Pref="dom.webgpu.enabled"]
+[Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
 interface GPUBindGroup {
 };
 GPUBindGroup includes GPUObjectBase;
 
 dictionary GPUBindGroupDescriptor : GPUObjectDescriptorBase {
     required GPUBindGroupLayout layout;
-    required sequence<GPUBindGroupBindings> bindings;
+    required sequence<GPUBindGroupEntry> entries;
 };
 
-typedef /*(GPUSampler or GPUTextureView or*/ GPUBufferBindings/*)*/ GPUBindingResource;
+typedef (GPUSampler or GPUTextureView or GPUBufferBindings) GPUBindingResource;
 
-// Note: Servo codegen doesn't like the name `GPUBindGroupBinding` because it's already occupied
-// dictionary GPUBindGroupBinding {
-dictionary GPUBindGroupBindings {
-    required unsigned long binding;
+dictionary GPUBindGroupEntry {
+    required GPUIndex32 binding;
     required GPUBindingResource resource;
 };
 
@@ -26,6 +24,6 @@ dictionary GPUBindGroupBindings {
 // dictionary GPUBufferBinding {
 dictionary GPUBufferBindings {
     required GPUBuffer buffer;
-    GPUBufferSize offset = 0;
-    GPUBufferSize size;
+    GPUSize64 offset = 0;
+    GPUSize64 size;
 };

@@ -7,40 +7,64 @@ use canvas_traits::canvas::*;
 use canvas_traits::ConstellationCanvasMsg;
 use crossbeam_channel::{select, unbounded, Sender};
 use euclid::default::Size2D;
+use gfx::font_cache_thread::FontCacheThread;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::thread;
+use webrender_api::{ImageData, ImageDescriptor, ImageKey};
 
 pub enum AntialiasMode {
     Default,
     None,
 }
 
+pub enum ImageUpdate {
+    Add(ImageKey, ImageDescriptor, ImageData),
+    Update(ImageKey, ImageDescriptor, ImageData),
+    Delete(ImageKey),
+}
+
+pub trait WebrenderApi {
+    fn generate_key(&self) -> Result<webrender_api::ImageKey, ()>;
+    fn update_images(&self, updates: Vec<ImageUpdate>);
+    fn clone(&self) -> Box<dyn WebrenderApi>;
+}
+
 pub struct CanvasPaintThread<'a> {
     canvases: HashMap<CanvasId, CanvasData<'a>>,
     next_canvas_id: CanvasId,
+    webrender_api: Box<dyn WebrenderApi>,
+    font_cache_thread: FontCacheThread,
 }
 
 impl<'a> CanvasPaintThread<'a> {
-    fn new() -> CanvasPaintThread<'a> {
+    fn new(
+        webrender_api: Box<dyn WebrenderApi>,
+        font_cache_thread: FontCacheThread,
+    ) -> CanvasPaintThread<'a> {
         CanvasPaintThread {
             canvases: HashMap::new(),
             next_canvas_id: CanvasId(0),
+            webrender_api,
+            font_cache_thread,
         }
     }
 
     /// Creates a new `CanvasPaintThread` and returns an `IpcSender` to
     /// communicate with it.
-    pub fn start() -> (Sender<ConstellationCanvasMsg>, IpcSender<CanvasMsg>) {
+    pub fn start(
+        webrender_api: Box<dyn WebrenderApi + Send>,
+        font_cache_thread: FontCacheThread,
+    ) -> (Sender<ConstellationCanvasMsg>, IpcSender<CanvasMsg>) {
         let (ipc_sender, ipc_receiver) = ipc::channel::<CanvasMsg>().unwrap();
         let msg_receiver = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(ipc_receiver);
         let (create_sender, create_receiver) = unbounded();
         thread::Builder::new()
             .name("CanvasThread".to_owned())
             .spawn(move || {
-                let mut canvas_paint_thread = CanvasPaintThread::new();
+                let mut canvas_paint_thread = CanvasPaintThread::new(webrender_api, font_cache_thread);
                 loop {
                     select! {
                         recv(msg_receiver) -> msg => {
@@ -74,14 +98,9 @@ impl<'a> CanvasPaintThread<'a> {
                                 Ok(ConstellationCanvasMsg::Create {
                                     id_sender: creator,
                                     size,
-                                    webrender_sender: webrenderer_api_sender,
                                     antialias
                                 }) => {
-                                    let canvas_id = canvas_paint_thread.create_canvas(
-                                        size,
-                                        webrenderer_api_sender,
-                                        antialias,
-                                    );
+                                    let canvas_id = canvas_paint_thread.create_canvas(size, antialias);
                                     creator.send(canvas_id).unwrap();
                                 },
                                 Ok(ConstellationCanvasMsg::Exit) => break,
@@ -99,22 +118,24 @@ impl<'a> CanvasPaintThread<'a> {
         (create_sender, ipc_sender)
     }
 
-    pub fn create_canvas(
-        &mut self,
-        size: Size2D<u64>,
-        webrender_api_sender: webrender_api::RenderApiSender,
-        antialias: bool,
-    ) -> CanvasId {
+    pub fn create_canvas(&mut self, size: Size2D<u64>, antialias: bool) -> CanvasId {
         let antialias = if antialias {
             AntialiasMode::Default
         } else {
             AntialiasMode::None
         };
 
+        let font_cache_thread = self.font_cache_thread.clone();
+
         let canvas_id = self.next_canvas_id.clone();
         self.next_canvas_id.0 += 1;
 
-        let canvas_data = CanvasData::new(size, webrender_api_sender, antialias, canvas_id.clone());
+        let canvas_data = CanvasData::new(
+            size,
+            self.webrender_api.clone(),
+            antialias,
+            font_cache_thread,
+        );
         self.canvases.insert(canvas_id.clone(), canvas_data);
 
         canvas_id
@@ -122,9 +143,10 @@ impl<'a> CanvasPaintThread<'a> {
 
     fn process_canvas_2d_message(&mut self, message: Canvas2dMsg, canvas_id: CanvasId) {
         match message {
-            Canvas2dMsg::FillText(text, x, y, max_width, style) => {
+            Canvas2dMsg::FillText(text, x, y, max_width, style, is_rtl) => {
                 self.canvas(canvas_id).set_fill_style(style);
-                self.canvas(canvas_id).fill_text(text, x, y, max_width);
+                self.canvas(canvas_id)
+                    .fill_text(text, x, y, max_width, is_rtl);
             },
             Canvas2dMsg::FillRect(rect, style) => {
                 self.canvas(canvas_id).set_fill_style(style);
@@ -235,6 +257,13 @@ impl<'a> CanvasPaintThread<'a> {
             },
             Canvas2dMsg::SetShadowBlur(value) => self.canvas(canvas_id).set_shadow_blur(value),
             Canvas2dMsg::SetShadowColor(color) => self.canvas(canvas_id).set_shadow_color(color),
+            Canvas2dMsg::SetFont(font_style) => self.canvas(canvas_id).set_font(font_style),
+            Canvas2dMsg::SetTextAlign(text_align) => {
+                self.canvas(canvas_id).set_text_align(text_align)
+            },
+            Canvas2dMsg::SetTextBaseline(text_baseline) => {
+                self.canvas(canvas_id).set_text_baseline(text_baseline)
+            },
         }
     }
 

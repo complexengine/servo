@@ -27,8 +27,8 @@ use html5ever::{LocalName, Prefix};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
 use net_traits::image_cache::{
-    CanRequestImages, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse,
-    PendingImageId, UsePlaceholder,
+    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
+    UsePlaceholder,
 };
 use net_traits::request::{CredentialsMode, Destination, RequestBuilder};
 use net_traits::{
@@ -163,12 +163,15 @@ impl HTMLVideoElement {
             None,
             sender,
             UsePlaceholder::No,
-            CanRequestImages::Yes,
         );
 
         match cache_result {
-            ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable(img, url)) => {
-                self.process_image_response(ImageResponse::Loaded(img, url));
+            ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
+                image,
+                url,
+                ..
+            }) => {
+                self.process_image_response(ImageResponse::Loaded(image, url));
             },
             ImageCacheResult::ReadyForRequest(id) => {
                 self.do_fetch_poster_frame(poster_url, id, cancel_receiver)
@@ -186,7 +189,7 @@ impl HTMLVideoElement {
     ) {
         // Continuation of step 4.
         let document = document_from_node(self);
-        let request = RequestBuilder::new(poster_url.clone())
+        let request = RequestBuilder::new(poster_url.clone(), document.global().get_referrer())
             .destination(Destination::Image)
             .credentials_mode(CredentialsMode::Include)
             .use_url_credentials(true)

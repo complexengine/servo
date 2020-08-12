@@ -5,11 +5,13 @@
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::identityhub::Identities;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::paintworkletglobalscope::PaintWorkletTask;
 use crate::dom::testworkletglobalscope::TestWorkletGlobalScope;
 use crate::dom::testworkletglobalscope::TestWorkletTask;
 use crate::dom::worklet::WorkletExecutor;
+use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::JSContext;
 use crate::script_thread::MainThreadScriptMsg;
 use crossbeam_channel::Sender;
@@ -21,6 +23,7 @@ use js::rust::Runtime;
 use msg::constellation_msg::PipelineId;
 use net_traits::image_cache::ImageCache;
 use net_traits::ResourceThreads;
+use parking_lot::Mutex;
 use profile_traits::mem;
 use profile_traits::time;
 use script_traits::{Painter, ScriptMsg};
@@ -71,6 +74,7 @@ impl WorkletGlobalScope {
                 Default::default(),
                 init.is_headless,
                 init.user_agent.clone(),
+                init.gpu_id_hub.clone(),
             ),
             base_url,
             to_script_thread_sender: init.to_script_thread_sender.clone(),
@@ -85,10 +89,14 @@ impl WorkletGlobalScope {
 
     /// Evaluate a JS script in this global.
     pub fn evaluate_js(&self, script: &str) -> bool {
-        debug!("Evaluating Dom.");
+        debug!("Evaluating Dom in a worklet.");
         rooted!(in (*self.globalscope.get_cx()) let mut rval = UndefinedValue());
-        self.globalscope
-            .evaluate_js_on_global_with_result(&*script, rval.handle_mut())
+        self.globalscope.evaluate_js_on_global_with_result(
+            &*script,
+            rval.handle_mut(),
+            ScriptFetchOptions::default_classic_script(&self.globalscope),
+            self.globalscope.api_base_url(),
+        )
     }
 
     /// Register a paint worklet to the script thread.
@@ -156,6 +164,8 @@ pub struct WorkletGlobalScopeInit {
     pub is_headless: bool,
     /// An optional string allowing the user agent to be set for testing
     pub user_agent: Cow<'static, str>,
+    /// Identity manager for WebGPU resources
+    pub gpu_id_hub: Arc<Mutex<Identities>>,
 }
 
 /// <https://drafts.css-houdini.org/worklets/#worklet-global-scope-type>

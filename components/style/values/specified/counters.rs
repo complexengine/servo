@@ -4,7 +4,7 @@
 
 //! Specified types for counter properties.
 
-#[cfg(feature = "servo")]
+#[cfg(feature = "servo-layout-2013")]
 use crate::computed_values::list_style_type::T as ListStyleType;
 use crate::parser::{Parse, ParserContext};
 use crate::values::generics::counters as generics;
@@ -17,6 +17,7 @@ use crate::values::specified::Attr;
 use crate::values::specified::Integer;
 use crate::values::CustomIdent;
 use cssparser::{Parser, Token};
+#[cfg(feature = "servo-layout-2013")]
 use selectors::parser::SelectorParseErrorKind;
 use style_traits::{ParseError, StyleParseErrorKind};
 
@@ -50,7 +51,7 @@ fn parse_counters<'i, 't>(
     default_value: i32,
 ) -> Result<Vec<CounterPair<Integer>>, ParseError<'i>> {
     if input
-        .try(|input| input.expect_ident_matching("none"))
+        .try_parse(|input| input.expect_ident_matching("none"))
         .is_ok()
     {
         return Ok(vec![]);
@@ -69,7 +70,7 @@ fn parse_counters<'i, 't>(
         };
 
         let value = input
-            .try(|input| Integer::parse(context, input))
+            .try_parse(|input| Integer::parse(context, input))
             .unwrap_or(Integer::new(default_value));
         counters.push(CounterPair { name, value });
     }
@@ -88,10 +89,10 @@ pub type Content = generics::GenericContent<SpecifiedImageUrl>;
 pub type ContentItem = generics::GenericContentItem<SpecifiedImageUrl>;
 
 impl Content {
-    #[cfg(feature = "servo")]
+    #[cfg(feature = "servo-layout-2013")]
     fn parse_counter_style(_: &ParserContext, input: &mut Parser) -> ListStyleType {
         input
-            .try(|input| {
+            .try_parse(|input| {
                 input.expect_comma()?;
                 ListStyleType::parse(input)
             })
@@ -101,7 +102,7 @@ impl Content {
     #[cfg(feature = "gecko")]
     fn parse_counter_style(context: &ParserContext, input: &mut Parser) -> CounterStyle {
         input
-            .try(|input| {
+            .try_parse(|input| {
                 input.expect_comma()?;
                 CounterStyle::parse(context, input)
             })
@@ -119,13 +120,13 @@ impl Parse for Content {
         input: &mut Parser<'i, 't>,
     ) -> Result<Self, ParseError<'i>> {
         if input
-            .try(|input| input.expect_ident_matching("normal"))
+            .try_parse(|input| input.expect_ident_matching("normal"))
             .is_ok()
         {
             return Ok(generics::Content::Normal);
         }
         if input
-            .try(|input| input.expect_ident_matching("none"))
+            .try_parse(|input| input.expect_ident_matching("none"))
             .is_ok()
         {
             return Ok(generics::Content::None);
@@ -136,7 +137,7 @@ impl Parse for Content {
         loop {
             #[cfg(any(feature = "gecko", feature = "servo-layout-2020"))]
             {
-                if let Ok(url) = input.try(|i| SpecifiedImageUrl::parse(context, i)) {
+                if let Ok(url) = input.try_parse(|i| SpecifiedImageUrl::parse(context, i)) {
                     content.push(generics::ContentItem::Url(url));
                     continue;
                 }
@@ -149,12 +150,14 @@ impl Parse for Content {
                 },
                 Ok(&Token::Function(ref name)) => {
                     let result = match_ignore_ascii_case! { &name,
+                        #[cfg(any(feature = "gecko", feature = "servo-layout-2013"))]
                         "counter" => input.parse_nested_block(|input| {
                             let location = input.current_source_location();
                             let name = CustomIdent::from_ident(location, input.expect_ident()?, &[])?;
                             let style = Content::parse_counter_style(context, input);
                             Ok(generics::ContentItem::Counter(name, style))
                         }),
+                        #[cfg(any(feature = "gecko", feature = "servo-layout-2013"))]
                         "counters" => input.parse_nested_block(|input| {
                             let location = input.current_source_location();
                             let name = CustomIdent::from_ident(location, input.expect_ident()?, &[])?;
@@ -176,6 +179,7 @@ impl Parse for Content {
                     }?;
                     content.push(result);
                 },
+                #[cfg(any(feature = "gecko", feature = "servo-layout-2013"))]
                 Ok(&Token::Ident(ref ident)) => {
                     content.push(match_ignore_ascii_case! { &ident,
                         "open-quote" => generics::ContentItem::OpenQuote,

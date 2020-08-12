@@ -338,6 +338,7 @@ impl InlineAbsoluteFragmentInfo {
 pub enum CanvasFragmentSource {
     WebGL(webrender_api::ImageKey),
     Image(Option<Arc<Mutex<IpcSender<CanvasMsg>>>>),
+    WebGPU(webrender_api::ImageKey),
 }
 
 #[derive(Clone)]
@@ -355,6 +356,7 @@ impl CanvasFragmentInfo {
             HTMLCanvasDataSource::Image(ipc_sender) => CanvasFragmentSource::Image(
                 ipc_sender.map(|renderer| Arc::new(Mutex::new(renderer))),
             ),
+            HTMLCanvasDataSource::WebGPU(image_key) => CanvasFragmentSource::WebGPU(image_key),
         };
 
         CanvasFragmentInfo {
@@ -431,8 +433,8 @@ impl ImageFragmentInfo {
                     layout_context
                         .get_or_request_image_or_meta(node.opaque(), url, UsePlaceholder::Yes)
                         .map(|result| match result {
-                            ImageOrMetadataAvailable::ImageAvailable(i, _) => {
-                                ImageOrMetadata::Image(i)
+                            ImageOrMetadataAvailable::ImageAvailable { image, .. } => {
+                                ImageOrMetadata::Image(image)
                             },
                             ImageOrMetadataAvailable::MetadataAvailable(m) => {
                                 ImageOrMetadata::Metadata(m)
@@ -2728,6 +2730,12 @@ impl Fragment {
         !self.style().get_box().transform.0.is_empty() ||
             !self.style().get_effects().filter.0.is_empty() ||
             self.style().get_box().perspective != Perspective::None
+    }
+
+    /// Returns true if this fragment has a transform applied that causes it to take up no space.
+    pub fn has_non_invertible_transform(&self) -> bool {
+        self.transform_matrix(&Rect::default())
+            .map_or(false, |matrix| !matrix.is_invertible())
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.

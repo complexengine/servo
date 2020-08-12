@@ -242,6 +242,16 @@ class EarlyTestharnessReport(Rule):
     to_fix = "flip the order"
 
 
+class EarlyTestdriverVendor(Rule):
+    name = "EARLY-TESTDRIVER-VENDOR"
+    description = collapse("""
+        Test file has an instance of
+        `<script src='/resources/testdriver-vendor.js'>` prior to
+        `<script src='/resources/testdriver.js'>`
+    """)
+    to_fix = "flip the order"
+
+
 class MultipleTestdriver(Rule):
     name = "MULTIPLE-TESTDRIVER"
     description = "More than one `<script src='/resources/testdriver.js'>`"
@@ -322,6 +332,21 @@ class TestharnessInOtherType(Rule):
     description = "testharness.js included in a %s test"
 
 
+class DuplicateBasenamePath(Rule):
+    name = "DUPLICATE-BASENAME-PATH"
+    description = collapse("""
+            File has identical basename path (path excluding extension) as
+            other file(s) (found extensions: %s)
+    """)
+    to_fix = "rename files so they have unique basename paths"
+
+
+class TentativeDirectoryName(Rule):
+    name = "TENTATIVE-DIRECTORY-NAME"
+    description = "Directories for tentative tests must be named exactly 'tentative'"
+    to_fix = "rename directory to be called 'tentative'"
+
+
 class Regexp(six.with_metaclass(abc.ABCMeta)):
     @abc.abstractproperty
     def pattern(self):
@@ -345,7 +370,7 @@ class Regexp(six.with_metaclass(abc.ABCMeta)):
         self._re = re.compile(self.pattern)  # type: Pattern[bytes]
 
     def applies(self, path):
-        # type: (str) -> bool
+        # type: (Text) -> bool
         return (self.file_extensions is None or
                 os.path.splitext(path)[1] in self.file_extensions)
 
@@ -395,6 +420,11 @@ class WebPlatformTestRegexp(Regexp):
     pattern = br"web\-platform\.test"
     name = "WEB-PLATFORM.TEST"
     description = "Internal web-platform.test domain used"
+    to_fix = """
+        use [server-side substitution](https://web-platform-tests.org/writing-tests/server-pipes.html#sub),
+        along with the [`.sub` filename-flag](https://web-platform-tests.org/writing-tests/file-names.html#test-features),
+        to replace web-platform.test with `{{domains[]}}`
+    """
 
 
 class Webidl2Regexp(Regexp):

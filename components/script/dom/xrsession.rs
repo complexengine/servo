@@ -16,9 +16,6 @@ use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRFrameRequestCal
 use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRSessionMethods;
 use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRVisibilityState;
 use crate::dom::bindings::codegen::Bindings::XRSystemBinding::XRSessionMode;
-use crate::dom::bindings::codegen::Bindings::XRWebGLLayerBinding::{
-    XRWebGLLayerMethods, XRWebGLRenderingContext,
-};
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
@@ -40,7 +37,7 @@ use crate::dom::xrspace::XRSpace;
 use crate::realms::InRealm;
 use crate::task_source::TaskSource;
 use dom_struct::dom_struct;
-use euclid::{Rect, RigidTransform3D, Transform3D, Vector3D};
+use euclid::{RigidTransform3D, Transform3D, Vector3D};
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::router::ROUTER;
 use metrics::ToMs;
@@ -50,6 +47,7 @@ use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI};
 use std::mem;
 use std::rc::Rc;
+use webxr_api::ContextId as WebXRContextId;
 use webxr_api::{
     self, util, ApiSpace, Display, EntityTypes, EnvironmentBlendMode, Event as XREvent, Frame,
     FrameUpdateEvent, HitTestId, HitTestSource, Ray, SelectEvent, SelectKind, Session, SessionId,
@@ -74,6 +72,8 @@ pub struct XRSession {
     next_raf_id: Cell<i32>,
     #[ignore_malloc_size_of = "closures are hard"]
     raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
+    #[ignore_malloc_size_of = "closures are hard"]
+    current_raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
     input_sources: Dom<XRInputSourceArray>,
     // Any promises from calling end()
     #[ignore_malloc_size_of = "promises are hard"]
@@ -110,6 +110,7 @@ impl XRSession {
 
             next_raf_id: Cell::new(0),
             raf_callback_list: DomRefCell::new(vec![]),
+            current_raf_callback_list: DomRefCell::new(vec![]),
             input_sources: Dom::from_ref(input_sources),
             end_promises: DomRefCell::new(vec![]),
             ended: Cell::new(false),
@@ -130,7 +131,7 @@ impl XRSession {
         } else {
             None
         };
-        let render_state = XRRenderState::new(global, 0.1, 1000.0, ivfov, None, &[]);
+        let render_state = XRRenderState::new(global, 0.1, 1000.0, ivfov, None, Vec::new());
         let input_sources = XRInputSourceArray::new(global);
         let ret = reflect_dom_object(
             Box::new(XRSession::new_inherited(
@@ -157,6 +158,13 @@ impl XRSession {
 
     pub fn is_immersive(&self) -> bool {
         self.mode != XRSessionMode::Inline
+    }
+
+    // https://immersive-web.github.io/layers/#feature-descriptor-layers
+    pub fn has_layers_feature(&self) -> bool {
+        // We do not support creating layers other than projection layers
+        // https://github.com/servo/servo/issues/27493
+        false
     }
 
     fn setup_raf_loop(&self, frame_receiver: IpcReceiver<Frame>) {
@@ -351,7 +359,7 @@ impl XRSession {
 
     /// https://immersive-web.github.io/webxr/#xr-animation-frame
     fn raf_callback(&self, mut frame: Frame) {
-        debug!("WebXR RAF callback");
+        debug!("WebXR RAF callback {:?}", frame);
         #[cfg(feature = "xr-profile")]
         let raf_start = time::precise_time_ns();
         #[cfg(feature = "xr-profile")]
@@ -360,7 +368,9 @@ impl XRSession {
             (raf_start - frame.sent_time) as f64 / 1_000_000.
         );
 
-        // Step 1
+        // Step 1-2 happen in the xebxr device thread
+
+        // Step 3
         if let Some(pending) = self.pending_render_state.take() {
             // https://immersive-web.github.io/webxr/#apply-the-pending-render-state
             // (Steps 1-4 are implicit)
@@ -368,66 +378,80 @@ impl XRSession {
             self.active_render_state.set(&pending);
             // Step 6-7: XXXManishearth handle inlineVerticalFieldOfView
 
-            if self.is_immersive() {
-                let swap_chain_id = pending
-                    .GetBaseLayer()
-                    .map(|layer| layer.swap_chain_id())
-                    .or_else(|| {
-                        self.active_render_state.get().with_layers(|layers| {
-                            layers.get(0).and_then(|layer| layer.swap_chain_id())
-                        })
-                    });
-                self.session.borrow_mut().set_swap_chain(swap_chain_id);
-            } else {
+            if !self.is_immersive() {
                 self.update_inline_projection_matrix()
             }
         }
 
+        // TODO: how does this fit the webxr spec?
         for event in frame.events.drain(..) {
-            self.handle_frame_update(event);
+            self.handle_frame_event(event);
         }
 
-        // Step 2
-        if !self.active_render_state.get().has_layer() {
+        // Step 4
+        // TODO: what should this check be?
+        // This is checking that the new render state has the same
+        // layers as the frame.
+        // Related to https://github.com/immersive-web/webxr/issues/1051
+        if !self
+            .active_render_state
+            .get()
+            .has_sub_images(&frame.sub_images[..])
+        {
+            // If the frame has different layers than the render state,
+            // we just return early, drawing a blank frame.
+            // This can result in flickering when the render state is changed.
+            // TODO: it would be better to not render anything until the next frame.
+            warn!("Rendering blank XR frame");
+            self.session.borrow_mut().render_animation_frame();
             return;
         }
 
-        // Step 3: XXXManishearth handle inline session
+        // Step 5: XXXManishearth handle inline session
 
-        // Step 4-5
-        let mut callbacks = mem::replace(&mut *self.raf_callback_list.borrow_mut(), vec![]);
+        // Step 6-7
+        {
+            let mut current = self.current_raf_callback_list.borrow_mut();
+            assert!(current.is_empty());
+            mem::swap(&mut *self.raf_callback_list.borrow_mut(), &mut current);
+        }
         let start = self.global().as_window().get_navigation_start();
         let time = reduce_timing_resolution((frame.time_ns - start).to_ms());
 
         let frame = XRFrame::new(&self.global(), self, frame);
-        // Step 6,7
+        // Step 8-9
         frame.set_active(true);
         frame.set_animation_frame(true);
 
-        // Step 8
+        // Step 10
+        self.apply_frame_updates(&*frame);
+
+        // TODO: how does this fit with the webxr and xr layers specs?
+        self.layers_begin_frame(&*frame);
+
+        // Step 11-12
         self.outside_raf.set(false);
-        for (_, callback) in callbacks.drain(..) {
+        let len = self.current_raf_callback_list.borrow().len();
+        for i in 0..len {
+            let callback = self.current_raf_callback_list.borrow()[i]
+                .1
+                .as_ref()
+                .map(|callback| Rc::clone(callback));
             if let Some(callback) = callback {
                 let _ = callback.Call__(time, &frame, ExceptionHandling::Report);
             }
         }
         self.outside_raf.set(true);
+        *self.current_raf_callback_list.borrow_mut() = vec![];
 
+        // TODO: how does this fit with the webxr and xr layers specs?
+        self.layers_end_frame(&*frame);
+
+        // Step 13
         frame.set_active(false);
-        if self.is_immersive() {
-            if let Some(base_layer) = self.active_render_state.get().GetBaseLayer() {
-                base_layer.swap_buffers();
-            } else {
-                self.active_render_state.get().with_layers(|layers| {
-                    for layer in layers {
-                        layer.swap_buffers();
-                    }
-                });
-            }
-            self.session.borrow_mut().render_animation_frame();
-        } else {
-            self.session.borrow_mut().start_render_loop();
-        }
+
+        // TODO: how does this fit the webxr spec?
+        self.session.borrow_mut().render_animation_frame();
 
         #[cfg(feature = "xr-profile")]
         println!(
@@ -463,17 +487,10 @@ impl XRSession {
     /// Constructs a View suitable for inline sessions using the inlineVerticalFieldOfView and canvas size
     pub fn inline_view(&self) -> View<Viewer> {
         debug_assert!(!self.is_immersive());
-        let size = self
-            .active_render_state
-            .get()
-            .GetBaseLayer()
-            .expect("Must never construct views when base layer is not set")
-            .size();
         View {
             // Inline views have no offset
             transform: RigidTransform3D::identity(),
             projection: *self.inline_projection_matrix.borrow(),
-            viewport: Rect::from_size(size.to_i32()),
         }
     }
 
@@ -483,16 +500,40 @@ impl XRSession {
 
     pub fn dirty_layers(&self) {
         if let Some(layer) = self.RenderState().GetBaseLayer() {
-            match layer.Context() {
-                XRWebGLRenderingContext::WebGLRenderingContext(c) => c.mark_as_dirty(),
-                XRWebGLRenderingContext::WebGL2RenderingContext(c) => {
-                    c.base_context().mark_as_dirty()
-                },
-            }
+            layer.context().mark_as_dirty();
         }
     }
 
-    fn handle_frame_update(&self, event: FrameUpdateEvent) {
+    // TODO: how does this align with the layers spec?
+    fn layers_begin_frame(&self, frame: &XRFrame) {
+        if let Some(layer) = self.active_render_state.get().GetBaseLayer() {
+            layer.begin_frame(frame);
+        }
+        self.active_render_state.get().with_layers(|layers| {
+            for layer in layers {
+                layer.begin_frame(frame);
+            }
+        });
+    }
+
+    // TODO: how does this align with the layers spec?
+    fn layers_end_frame(&self, frame: &XRFrame) {
+        if let Some(layer) = self.active_render_state.get().GetBaseLayer() {
+            layer.end_frame(frame);
+        }
+        self.active_render_state.get().with_layers(|layers| {
+            for layer in layers {
+                layer.end_frame(frame);
+            }
+        });
+    }
+
+    /// https://immersive-web.github.io/webxr/#xrframe-apply-frame-updates
+    fn apply_frame_updates(&self, _frame: &XRFrame) {
+        // TODO: add a comment about why this is empty right now!
+    }
+
+    fn handle_frame_event(&self, event: FrameUpdateEvent) {
         match event {
             FrameUpdateEvent::HitTestSourceAdded(id) => {
                 if let Some(promise) = self.pending_hit_test_promises.borrow_mut().remove(&id) {
@@ -557,7 +598,7 @@ impl XRSessionMethods for XRSession {
             return Err(Error::InvalidState);
         }
         // Step 3:
-        if let Some(ref layer) = init.baseLayer {
+        if let Some(Some(ref layer)) = init.baseLayer {
             if Dom::from_ref(layer.session()) != Dom::from_ref(self) {
                 return Err(Error::InvalidState);
             }
@@ -568,26 +609,65 @@ impl XRSessionMethods for XRSession {
             return Err(Error::InvalidState);
         }
 
-        // TODO: add spec link for this step once XR layers has settled down
-        // https://immersive-web.github.io/layers/
-        if init.baseLayer.is_some() && init.layers.is_some() {
-            return Err(Error::InvalidState);
+        // https://immersive-web.github.io/layers/#updaterenderstatechanges
+        // Step 1.
+        if init.baseLayer.is_some() {
+            if self.has_layers_feature() {
+                return Err(Error::NotSupported);
+            }
+            // https://github.com/immersive-web/layers/issues/189
+            if init.layers.is_some() {
+                return Err(Error::Type(String::from(
+                    "Cannot set WebXR layers and baseLayer",
+                )));
+            }
         }
 
-        // TODO: add spec link for this step once XR layers has settled down
-        // https://immersive-web.github.io/layers/
-        if init
-            .layers
-            .as_ref()
-            .map(|layers| layers.is_empty())
-            .unwrap_or(false)
-        {
-            return Err(Error::InvalidState);
+        if let Some(Some(ref layers)) = init.layers {
+            // Step 2
+            for layer in layers {
+                let count = layers
+                    .iter()
+                    .filter(|other| other.layer_id() == layer.layer_id())
+                    .count();
+                if count > 1 {
+                    return Err(Error::Type(String::from("Duplicate entry in WebXR layers")));
+                }
+            }
+
+            // Step 3
+            for layer in layers {
+                if layer.session() != self {
+                    return Err(Error::Type(String::from(
+                        "Layer from different session in WebXR layers",
+                    )));
+                }
+            }
         }
 
+        // Step 4-5
         let pending = self
             .pending_render_state
             .or_init(|| self.active_render_state.get().clone_object());
+
+        // Step 6
+        if let Some(ref layers) = init.layers {
+            let layers = layers.as_deref().unwrap_or_default();
+            pending.set_base_layer(None);
+            pending.set_layers(layers.iter().map(|x| &**x).collect());
+            let layers = layers
+                .iter()
+                .filter_map(|layer| {
+                    let context_id = WebXRContextId::from(layer.context_id());
+                    let layer_id = layer.layer_id()?;
+                    Some((context_id, layer_id))
+                })
+                .collect();
+            self.session.borrow_mut().set_layers(layers);
+        }
+
+        // End of https://immersive-web.github.io/layers/#updaterenderstatechanges
+
         if let Some(near) = init.depthNear {
             let mut near = *near;
             // Step 8 from #apply-the-pending-render-state
@@ -618,21 +698,23 @@ impl XRSessionMethods for XRSession {
             pending.set_inline_vertical_fov(fov);
         }
         if let Some(ref layer) = init.baseLayer {
-            pending.set_layer(Some(&layer));
-            pending.set_layers(&[]);
+            pending.set_base_layer(layer.as_deref());
+            pending.set_layers(Vec::new());
+            let layers = layer
+                .iter()
+                .filter_map(|layer| {
+                    let context_id = WebXRContextId::from(layer.context_id());
+                    let layer_id = layer.layer_id()?;
+                    Some((context_id, layer_id))
+                })
+                .collect();
+            self.session.borrow_mut().set_layers(layers);
         }
 
         if init.depthFar.is_some() || init.depthNear.is_some() {
             self.session
                 .borrow_mut()
                 .update_clip_planes(*pending.DepthNear() as f32, *pending.DepthFar() as f32);
-        }
-
-        // TODO: add spec link for this step once XR layers has settled down
-        // https://immersive-web.github.io/layers/
-        if let Some(ref layers) = init.layers {
-            pending.set_layer(None);
-            pending.set_layers(layers);
         }
 
         Ok(())
@@ -653,6 +735,11 @@ impl XRSessionMethods for XRSession {
     /// https://immersive-web.github.io/webxr/#dom-xrsession-cancelanimationframe
     fn CancelAnimationFrame(&self, frame: i32) {
         let mut list = self.raf_callback_list.borrow_mut();
+        if let Some(pair) = list.iter_mut().find(|pair| pair.0 == frame) {
+            pair.1 = None;
+        }
+
+        let mut list = self.current_raf_callback_list.borrow_mut();
         if let Some(pair) = list.iter_mut().find(|pair| pair.0 == frame) {
             pair.1 = None;
         }
@@ -798,10 +885,13 @@ impl XRSessionMethods for XRSession {
 
 // The pose of an object in native-space. Should never be exposed.
 pub type ApiPose = RigidTransform3D<f32, ApiSpace, webxr_api::Native>;
-// The pose of the viewer in some api-space.
-pub type ApiViewerPose = RigidTransform3D<f32, webxr_api::Viewer, ApiSpace>;
 // A transform between objects in some API-space
 pub type ApiRigidTransform = RigidTransform3D<f32, ApiSpace, ApiSpace>;
+
+#[derive(Clone, Copy)]
+pub struct BaseSpace;
+
+pub type BaseTransform = RigidTransform3D<f32, webxr_api::Native, BaseSpace>;
 
 #[allow(unsafe_code)]
 pub fn cast_transform<T, U, V, W>(

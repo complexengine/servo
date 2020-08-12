@@ -4,7 +4,9 @@
 
 //! A thread that takes a URL and streams back the binary data.
 
-use crate::connector::{create_http_client, create_tls_config, ALPN_H2_H1};
+use crate::connector::{
+    create_http_client, create_tls_config, ConnectionCerts, ExtraCerts, ALPN_H2_H1,
+};
 use crate::cookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
@@ -14,7 +16,7 @@ use crate::hsts::HstsList;
 use crate::http_cache::HttpCache;
 use crate::http_loader::{http_redirect_fetch, HttpState, HANDLE};
 use crate::storage_thread::StorageThreadFactory;
-use crate::websocket_loader;
+use crate::websocket_loader::{self, HANDLE as WS_HANDLE};
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::resources::{self, Resource};
@@ -143,6 +145,9 @@ fn create_http_states(
         None => resources::read_string(Resource::SSLCertificates),
     };
 
+    let extra_certs = ExtraCerts::new();
+    let connection_certs = ConnectionCerts::new();
+
     let http_state = HttpState {
         hsts_list: RwLock::new(hsts_list),
         cookie_jar: RwLock::new(cookie_jar),
@@ -151,10 +156,20 @@ fn create_http_states(
         http_cache: RwLock::new(http_cache),
         http_cache_state: Mutex::new(HashMap::new()),
         client: create_http_client(
-            create_tls_config(&certs, ALPN_H2_H1),
-            HANDLE.lock().unwrap().executor(),
+            create_tls_config(
+                &certs,
+                ALPN_H2_H1,
+                extra_certs.clone(),
+                connection_certs.clone(),
+            ),
+            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
         ),
+        extra_certs,
+        connection_certs,
     };
+
+    let extra_certs = ExtraCerts::new();
+    let connection_certs = ConnectionCerts::new();
 
     let private_http_state = HttpState {
         hsts_list: RwLock::new(HstsList::from_servo_preload()),
@@ -164,9 +179,16 @@ fn create_http_states(
         http_cache: RwLock::new(HttpCache::new()),
         http_cache_state: Mutex::new(HashMap::new()),
         client: create_http_client(
-            create_tls_config(&certs, ALPN_H2_H1),
-            HANDLE.lock().unwrap().executor(),
+            create_tls_config(
+                &certs,
+                ALPN_H2_H1,
+                extra_certs.clone(),
+                connection_certs.clone(),
+            ),
+            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
         ),
+        extra_certs,
+        connection_certs,
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))
@@ -331,6 +353,9 @@ impl ResourceChannelManager {
             },
             CoreResourceMsg::Synchronize(sender) => {
                 let _ = sender.send(());
+            },
+            CoreResourceMsg::ClearCache => {
+                http_state.http_cache.write().unwrap().clear();
             },
             CoreResourceMsg::ToFileManager(msg) => self.resource_manager.filemanager.handle(msg),
             CoreResourceMsg::Exit(sender) => {
@@ -590,6 +615,12 @@ impl CoreResourceManager {
         // blocks until all workers in the pool are done,
         // or a short timeout has been reached.
         self.thread_pool.exit();
+
+        // Shut-down the async runtime used by fetch workers.
+        drop(HANDLE.lock().unwrap().take());
+
+        // Shut-down the async runtime used by websocket workers.
+        drop(WS_HANDLE.lock().unwrap().take());
 
         debug!("Exited CoreResourceManager");
     }

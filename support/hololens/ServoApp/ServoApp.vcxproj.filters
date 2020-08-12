@@ -10,7 +10,6 @@
   <ItemGroup>
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
-    <ClCompile Include="logs.cpp" />
     <ClCompile Include="BrowserPage.cpp" />
     <ClCompile Include="App.cpp" />
     <ClCompile Include="ServoControl\OpenGLES.cpp">
@@ -22,10 +21,13 @@
     <ClCompile Include="ServoControl\ServoControl.cpp">
       <Filter>ServoControl</Filter>
     </ClCompile>
+    <ClCompile Include="Devtools\Client.cpp">
+      <Filter>Devtools</Filter>
+    </ClCompile>
+    <ClCompile Include="Bookmarks.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
-    <ClInclude Include="logs.h" />
     <ClInclude Include="BrowserPage.h" />
     <ClInclude Include="App.h" />
     <ClInclude Include="ServoControl\OpenGLES.h">
@@ -38,6 +40,14 @@
       <Filter>ServoControl</Filter>
     </ClInclude>
     <ClInclude Include="DefaultUrl.h" />
+    <ClInclude Include="strutils.h" />
+    <ClInclude Include="Devtools\Client.h">
+      <Filter>Devtools</Filter>
+    </ClInclude>
+    <ClInclude Include="ServoControl\Keys.h">
+      <Filter>ServoControl</Filter>
+    </ClInclude>
+    <ClInclude Include="Bookmarks.h" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="Assets\Wide310x150Logo.scale-200.png">
@@ -138,24 +148,6 @@
     </Image>
     <Image Include="Assets\Square44x44Logo.altform-unplated_targetsize-256.png">
       <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\UI\back.png">
-      <Filter>Assets\UI</Filter>
-    </Image>
-    <Image Include="Assets\UI\forward.png">
-      <Filter>Assets\UI</Filter>
-    </Image>
-    <Image Include="Assets\UI\reload.png">
-      <Filter>Assets\UI</Filter>
-    </Image>
-    <Image Include="Assets\UI\stop.png">
-      <Filter>Assets\UI</Filter>
-    </Image>
-    <Image Include="Assets\UI\home.png">
-      <Filter>Assets\UI</Filter>
-    </Image>
-    <Image Include="Assets\UI\devtools.png">
-      <Filter>Assets\UI</Filter>
     </Image>
   </ItemGroup>
   <ItemGroup>
@@ -865,6 +857,55 @@
     <None Include="..\..\..\target\x86_64-uwp-windows-msvc\release\swresample-3.dll">
       <Filter>ReleaseServoDLLs</Filter>
     </None>
+    <None Include="$(OpenXRLoaderBinaryRoot)\bin\openxr_loader.dll" />
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\debug\gstaudiobuffersplit.dll">
+      <Filter>DebugARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\debug\gstgio.dll">
+      <Filter>DebugARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\debug\gstid3tag.dll">
+      <Filter>DebugARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\debug\gstid3demux.dll">
+      <Filter>DebugARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\release\gstaudiobuffersplit.dll">
+      <Filter>ReleaseARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\release\gstgio.dll">
+      <Filter>ReleaseARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\release\gstid3tag.dll">
+      <Filter>ReleaseARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\aarch64-uwp-windows-msvc\release\gstid3demux.dll">
+      <Filter>ReleaseARM64ServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\debug\gstaudiobuffersplit.dll">
+      <Filter>DebugServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\debug\gstgio.dll">
+      <Filter>DebugServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\debug\gstid3tag.dll">
+      <Filter>DebugServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\debug\gstid3demux.dll">
+      <Filter>DebugServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\release\gstaudiobuffersplit.dll">
+      <Filter>ReleaseServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\release\gstgio.dll">
+      <Filter>ReleaseServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\release\gstid3tag.dll">
+      <Filter>ReleaseServoDLLs</Filter>
+    </None>
+    <None Include="..\..\..\target\x86_64-uwp-windows-msvc\release\gstid3demux.dll">
+      <Filter>ReleaseServoDLLs</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="Assets">
@@ -885,8 +926,20 @@
     <Filter Include="ServoControl">
       <UniqueIdentifier>{d21a959c-19d1-4a54-b942-692c27e5b3a6}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Assets\UI">
-      <UniqueIdentifier>{d49fe329-5e22-4470-8310-5b925419e6f8}</UniqueIdentifier>
+    <Filter Include="Resources">
+      <UniqueIdentifier>{c05cce0c-d62c-11ea-87d0-0242ac130003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resources\Strings">
+      <UniqueIdentifier>{49e23631-d899-4caf-bf7b-30776fee4d09}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resources\Strings\en-US">
+      <UniqueIdentifier>{c12ff5d4-3730-4a0e-8b16-56ded3138875}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resources\Strings\fr-FR">
+      <UniqueIdentifier>{b7d3273d-a27c-4176-87a1-3d5222b796b3}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Devtools">
+      <UniqueIdentifier>{12da8b9d-c14a-4be1-8328-c4e729fdfd3b}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -900,5 +953,16 @@
   </ItemGroup>
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <PRIResource Include="Resources\PromotedPrefs.resw">
+      <Filter>Resources</Filter>
+    </PRIResource>
+    <PRIResource Include="Resources\Strings\en-US\Resources.resw">
+      <Filter>Resources\Strings\en-US</Filter>
+    </PRIResource>
+    <PRIResource Include="Resources\Strings\fr-FR\Resources.resw">
+      <Filter>Resources\Strings\fr-FR</Filter>
+    </PRIResource>
   </ItemGroup>
 </Project>

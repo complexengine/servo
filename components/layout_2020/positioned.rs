@@ -4,17 +4,15 @@
 
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
-use crate::dom_traversal::{Contents, NodeExt};
+use crate::dom_traversal::{Contents, NodeAndStyleInfo, NodeExt};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragments::{BoxFragment, CollapsedBlockMargins, Fragment};
 use crate::geom::flow_relative::{Rect, Sides, Vec2};
 use crate::geom::{LengthOrAuto, LengthPercentageOrAuto};
-use crate::sizing::ContentSizesRequest;
 use crate::style_ext::{ComputedValuesExt, DisplayInside};
 use crate::{ContainingBlock, DefiniteContainingBlock};
-use rayon::iter::{IntoParallelRefIterator, ParallelExtend};
+use rayon::iter::{IntoParallelRefMutIterator, ParallelExtend};
 use rayon_croissant::ParallelIteratorExt;
-use servo_arc::Arc;
 use style::computed_values::position::T as Position;
 use style::properties::ComputedValues;
 use style::values::computed::{Length, LengthPercentage};
@@ -23,7 +21,7 @@ use style::Zero;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct AbsolutelyPositionedBox {
-    pub contents: IndependentFormattingContext,
+    pub context: IndependentFormattingContext,
 }
 
 pub(crate) struct PositioningContext {
@@ -36,22 +34,48 @@ pub(crate) struct PositioningContext {
 }
 
 pub(crate) struct HoistedAbsolutelyPositionedBox {
-    absolutely_positioned_box: Arc<AbsolutelyPositionedBox>,
+    absolutely_positioned_box: ArcRefCell<AbsolutelyPositionedBox>,
 
     /// The rank of the child from which this absolutely positioned fragment
     /// came from, when doing the layout of a block container. Used to compute
     /// static positions when going up the tree.
     pub(crate) tree_rank: usize,
 
-    box_offsets: Vec2<AbsoluteBoxOffsets>,
-
     /// A reference to a Fragment which is shared between this `HoistedAbsolutelyPositionedBox`
     /// and its placeholder `AbsoluteOrFixedPositionedFragment` in the original tree position.
     /// This will be used later in order to paint this hoisted box in tree order.
-    pub fragment: ArcRefCell<Option<ArcRefCell<Fragment>>>,
+    pub fragment: ArcRefCell<HoistedSharedFragment>,
 }
 
-#[derive(Clone, Debug)]
+/// A reference to a Fragment which is shared between `HoistedAbsolutelyPositionedBox`
+/// and its placeholder `AbsoluteOrFixedPositionedFragment` in the original tree position.
+/// This will be used later in order to paint this hoisted box in tree order.
+#[derive(Serialize)]
+pub(crate) struct HoistedSharedFragment {
+    pub(crate) fragment: Option<ArcRefCell<Fragment>>,
+    pub(crate) box_offsets: Vec2<AbsoluteBoxOffsets>,
+}
+
+impl HoistedSharedFragment {
+    pub(crate) fn new(box_offsets: Vec2<AbsoluteBoxOffsets>) -> Self {
+        HoistedSharedFragment {
+            fragment: None,
+            box_offsets,
+        }
+    }
+}
+
+impl HoistedSharedFragment {
+    /// In some cases `inset: auto`-positioned elements do not know their precise
+    /// position until after they're hoisted. This lets us adjust auto values
+    /// after the fact.
+    pub(crate) fn adjust_offsets(&mut self, offsets: Vec2<Length>) {
+        self.box_offsets.inline.adjust_offset(offsets.inline);
+        self.box_offsets.block.adjust_offset(offsets.block);
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub(crate) enum AbsoluteBoxOffsets {
     StaticStart {
         start: Length,
@@ -68,31 +92,28 @@ pub(crate) enum AbsoluteBoxOffsets {
     },
 }
 
+impl AbsoluteBoxOffsets {
+    fn adjust_offset(&mut self, new_offset: Length) {
+        match *self {
+            AbsoluteBoxOffsets::StaticStart { ref mut start } => *start = new_offset,
+            _ => (),
+        }
+    }
+}
+
 impl AbsolutelyPositionedBox {
     pub fn construct<'dom>(
         context: &LayoutContext,
-        node: impl NodeExt<'dom>,
-        style: Arc<ComputedValues>,
+        node_info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
         display_inside: DisplayInside,
         contents: Contents,
     ) -> Self {
-        // "Shrink-to-fit" in https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-width
-        let content_sizes = ContentSizesRequest::inline_if(
-            // If inline-size is non-auto, that value is used without shrink-to-fit
-            !style.inline_size_is_length() &&
-            // If it is, then the only case where shrink-to-fit is *not* used is
-            // if both offsets are non-auto, leaving inline-size as the only variable
-            // in the constraint equation.
-            !style.inline_box_offsets_are_both_non_auto(),
-        );
         Self {
-            contents: IndependentFormattingContext::construct(
+            context: IndependentFormattingContext::construct(
                 context,
-                node,
-                style,
+                node_info,
                 display_inside,
                 contents,
-                content_sizes,
                 // Text decorations are not propagated to any out-of-flow descendants.
                 TextDecorationLine::NONE,
             ),
@@ -100,14 +121,15 @@ impl AbsolutelyPositionedBox {
     }
 
     pub(crate) fn to_hoisted(
-        self_: Arc<Self>,
+        self_: ArcRefCell<Self>,
         initial_start_corner: Vec2<Length>,
         tree_rank: usize,
+        containing_block: &ContainingBlock,
     ) -> HoistedAbsolutelyPositionedBox {
         fn absolute_box_offsets(
             initial_static_start: Length,
-            start: LengthPercentageOrAuto,
-            end: LengthPercentageOrAuto,
+            start: LengthPercentageOrAuto<'_>,
+            end: LengthPercentageOrAuto<'_>,
         ) -> AbsoluteBoxOffsets {
             match (start.non_auto(), end.non_auto()) {
                 (None, None) => AbsoluteBoxOffsets::StaticStart {
@@ -124,10 +146,10 @@ impl AbsolutelyPositionedBox {
             }
         }
 
-        let box_offsets = self_.contents.style.box_offsets();
-        HoistedAbsolutelyPositionedBox {
-            tree_rank,
-            box_offsets: Vec2 {
+        let box_offsets = {
+            let box_ = self_.borrow();
+            let box_offsets = box_.context.style().box_offsets(containing_block);
+            Vec2 {
                 inline: absolute_box_offsets(
                     initial_start_corner.inline,
                     box_offsets.inline_start,
@@ -138,8 +160,11 @@ impl AbsolutelyPositionedBox {
                     box_offsets.block_start,
                     box_offsets.block_end,
                 ),
-            },
-            fragment: ArcRefCell::new(None),
+            }
+        };
+        HoistedAbsolutelyPositionedBox {
+            tree_rank,
+            fragment: ArcRefCell::new(HoistedSharedFragment::new(box_offsets)),
             absolutely_positioned_box: self_,
         }
     }
@@ -216,27 +241,6 @@ impl PositioningContext {
         new_fragment
     }
 
-    /// Given `fragment_layout_fn`, a closure which lays out a fragment in a provided
-    /// `PositioningContext`, create a positioning context for a positioned fragment and lay out
-    /// the fragment and all its children. Returns the resulting `BoxFragment`.
-    fn create_and_layout_positioned(
-        layout_context: &LayoutContext,
-        style: &ComputedValues,
-        for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
-        fragment_layout_fn: impl FnOnce(&mut Self) -> BoxFragment,
-    ) -> BoxFragment {
-        let mut new_context = match Self::new_for_style(style) {
-            Some(new_context) => new_context,
-            None => unreachable!(),
-        };
-
-        let mut new_fragment = fragment_layout_fn(&mut new_context);
-        new_context.layout_collected_children(layout_context, &mut new_fragment);
-        for_nearest_containing_block_for_all_descendants
-            .extend(new_context.for_nearest_containing_block_for_all_descendants);
-        new_fragment
-    }
-
     // Lay out the hoisted boxes collected into this `PositioningContext` and add them
     // to the given `BoxFragment`.
     pub fn layout_collected_children(
@@ -270,7 +274,7 @@ impl PositioningContext {
         while !hoisted_boxes.is_empty() {
             HoistedAbsolutelyPositionedBox::layout_many(
                 layout_context,
-                &hoisted_boxes,
+                &mut hoisted_boxes,
                 &mut laid_out_child_fragments,
                 &mut self.for_nearest_containing_block_for_all_descendants,
                 &containing_block,
@@ -283,12 +287,13 @@ impl PositioningContext {
 
     pub(crate) fn push(&mut self, box_: HoistedAbsolutelyPositionedBox) {
         if let Some(nearest) = &mut self.for_nearest_positioned_ancestor {
-            match box_
+            let position = box_
                 .absolutely_positioned_box
-                .contents
-                .style
-                .clone_position()
-            {
+                .borrow()
+                .context
+                .style()
+                .clone_position();
+            match position {
                 Position::Fixed => {}, // fall through
                 Position::Absolute => return nearest.push(box_),
                 Position::Static | Position::Relative => unreachable!(),
@@ -359,7 +364,7 @@ impl PositioningContext {
         {
             HoistedAbsolutelyPositionedBox::layout_many(
                 layout_context,
-                &std::mem::take(&mut self.for_nearest_containing_block_for_all_descendants),
+                &mut std::mem::take(&mut self.for_nearest_containing_block_for_all_descendants),
                 fragments,
                 &mut self.for_nearest_containing_block_for_all_descendants,
                 initial_containing_block,
@@ -371,13 +376,13 @@ impl PositioningContext {
 impl HoistedAbsolutelyPositionedBox {
     pub(crate) fn layout_many(
         layout_context: &LayoutContext,
-        boxes: &[Self],
+        boxes: &mut [Self],
         fragments: &mut Vec<ArcRefCell<Fragment>>,
         for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
         containing_block: &DefiniteContainingBlock,
     ) {
         if layout_context.use_rayon {
-            fragments.par_extend(boxes.par_iter().mapfold_reduce_into(
+            fragments.par_extend(boxes.par_iter_mut().mapfold_reduce_into(
                 for_nearest_containing_block_for_all_descendants,
                 |for_nearest_containing_block_for_all_descendants, box_| {
                     let new_fragment = ArcRefCell::new(Fragment::Box(box_.layout(
@@ -386,55 +391,59 @@ impl HoistedAbsolutelyPositionedBox {
                         containing_block,
                     )));
 
-                    *box_.fragment.borrow_mut() = Some(new_fragment.clone());
+                    box_.fragment.borrow_mut().fragment = Some(new_fragment.clone());
                     new_fragment
                 },
                 Vec::new,
                 vec_append_owned,
             ))
         } else {
-            fragments.extend(boxes.iter().map(|box_| {
+            fragments.extend(boxes.iter_mut().map(|box_| {
                 let new_fragment = ArcRefCell::new(Fragment::Box(box_.layout(
                     layout_context,
                     for_nearest_containing_block_for_all_descendants,
                     containing_block,
                 )));
-                *box_.fragment.borrow_mut() = Some(new_fragment.clone());
+                box_.fragment.borrow_mut().fragment = Some(new_fragment.clone());
                 new_fragment
             }))
         }
     }
 
     pub(crate) fn layout(
-        &self,
+        &mut self,
         layout_context: &LayoutContext,
         for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
         containing_block: &DefiniteContainingBlock,
     ) -> BoxFragment {
         let cbis = containing_block.size.inline;
         let cbbs = containing_block.size.block;
-        let style = &self.absolutely_positioned_box.contents.style;
-        let pbm = style.padding_border_margin(&containing_block.into());
+        let mut absolutely_positioned_box = self.absolutely_positioned_box.borrow_mut();
+        let pbm = absolutely_positioned_box
+            .context
+            .style()
+            .padding_border_margin(&containing_block.into());
 
-        let size;
-        let replaced_used_size;
-        match self.absolutely_positioned_box.contents.as_replaced() {
-            Ok(replaced) => {
+        let size = match &absolutely_positioned_box.context {
+            IndependentFormattingContext::Replaced(replaced) => {
                 // https://drafts.csswg.org/css2/visudet.html#abs-replaced-width
                 // https://drafts.csswg.org/css2/visudet.html#abs-replaced-height
-                let used_size =
-                    replaced.used_size_as_if_inline_element(&containing_block.into(), style, &pbm);
-                size = Vec2 {
+                let used_size = replaced.contents.used_size_as_if_inline_element(
+                    &containing_block.into(),
+                    &replaced.style,
+                    &pbm,
+                );
+                Vec2 {
                     inline: LengthOrAuto::LengthPercentage(used_size.inline),
                     block: LengthOrAuto::LengthPercentage(used_size.block),
-                };
-                replaced_used_size = Some(used_size);
+                }
             },
-            Err(_non_replaced) => {
-                size = style.content_box_size(&containing_block.into(), &pbm);
-                replaced_used_size = None;
-            },
-        }
+            IndependentFormattingContext::NonReplaced(non_replaced) => non_replaced
+                .style
+                .content_box_size(&containing_block.into(), &pbm),
+        };
+
+        let shared_fragment = self.fragment.borrow();
 
         let inline_axis = solve_axis(
             cbis,
@@ -442,7 +451,7 @@ impl HoistedAbsolutelyPositionedBox {
             pbm.margin.inline_start,
             pbm.margin.inline_end,
             /* avoid_negative_margin_start */ true,
-            &self.box_offsets.inline,
+            &shared_fragment.box_offsets.inline,
             size.inline,
         );
 
@@ -452,7 +461,7 @@ impl HoistedAbsolutelyPositionedBox {
             pbm.margin.block_start,
             pbm.margin.block_end,
             /* avoid_negative_margin_start */ false,
-            &self.box_offsets.block,
+            &shared_fragment.box_offsets.block,
             size.block,
         );
 
@@ -463,100 +472,102 @@ impl HoistedAbsolutelyPositionedBox {
             block_end: block_axis.margin_end,
         };
 
-        PositioningContext::create_and_layout_positioned(
-            layout_context,
-            style,
-            for_nearest_containing_block_for_all_descendants,
-            |positioning_context| {
-                let size;
-                let fragments;
-                match self.absolutely_positioned_box.contents.as_replaced() {
-                    Ok(replaced) => {
-                        // https://drafts.csswg.org/css2/visudet.html#abs-replaced-width
-                        // https://drafts.csswg.org/css2/visudet.html#abs-replaced-height
-                        let style = &self.absolutely_positioned_box.contents.style;
-                        size = replaced_used_size.unwrap();
-                        fragments = replaced.make_fragments(style, size.clone());
-                    },
-                    Err(non_replaced) => {
-                        // https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-width
-                        // https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-height
-                        let inline_size = inline_axis.size.auto_is(|| {
-                            let anchor = match inline_axis.anchor {
-                                Anchor::Start(start) => start,
-                                Anchor::End(end) => end,
-                            };
-                            let available_size = cbis -
-                                anchor -
-                                pbm.padding_border_sums.inline -
-                                margin.inline_sum();
-                            self.absolutely_positioned_box
-                                .contents
-                                .content_sizes
-                                .shrink_to_fit(available_size)
-                        });
-
-                        let containing_block_for_children = ContainingBlock {
-                            inline_size,
-                            block_size: block_axis.size,
-                            style,
+        let mut positioning_context =
+            PositioningContext::new_for_style(absolutely_positioned_box.context.style()).unwrap();
+        let mut new_fragment = {
+            let content_size;
+            let fragments;
+            match &mut absolutely_positioned_box.context {
+                IndependentFormattingContext::Replaced(replaced) => {
+                    // https://drafts.csswg.org/css2/visudet.html#abs-replaced-width
+                    // https://drafts.csswg.org/css2/visudet.html#abs-replaced-height
+                    let style = &replaced.style;
+                    content_size = size.auto_is(|| unreachable!());
+                    fragments = replaced
+                        .contents
+                        .make_fragments(style, content_size.clone());
+                },
+                IndependentFormattingContext::NonReplaced(non_replaced) => {
+                    // https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-width
+                    // https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-height
+                    let inline_size = inline_axis.size.auto_is(|| {
+                        let anchor = match inline_axis.anchor {
+                            Anchor::Start(start) => start,
+                            Anchor::End(end) => end,
                         };
-                        // https://drafts.csswg.org/css-writing-modes/#orthogonal-flows
-                        assert_eq!(
-                            containing_block.style.writing_mode,
-                            containing_block_for_children.style.writing_mode,
-                            "Mixed writing modes are not supported yet"
-                        );
-                        let dummy_tree_rank = 0;
-                        let independent_layout = non_replaced.layout(
-                            layout_context,
-                            positioning_context,
-                            &containing_block_for_children,
-                            dummy_tree_rank,
-                        );
+                        let available_size =
+                            cbis - anchor - pbm.padding_border_sums.inline - margin.inline_sum();
+                        non_replaced
+                            .inline_content_sizes(layout_context)
+                            .shrink_to_fit(available_size)
+                    });
 
-                        size = Vec2 {
-                            inline: inline_size,
-                            block: block_axis
-                                .size
-                                .auto_is(|| independent_layout.content_block_size),
-                        };
-                        fragments = independent_layout.fragments
-                    },
-                };
+                    let containing_block_for_children = ContainingBlock {
+                        inline_size,
+                        block_size: block_axis.size,
+                        style: &non_replaced.style,
+                    };
+                    // https://drafts.csswg.org/css-writing-modes/#orthogonal-flows
+                    assert_eq!(
+                        containing_block.style.writing_mode,
+                        containing_block_for_children.style.writing_mode,
+                        "Mixed writing modes are not supported yet"
+                    );
+                    let dummy_tree_rank = 0;
+                    let independent_layout = non_replaced.layout(
+                        layout_context,
+                        &mut positioning_context,
+                        &containing_block_for_children,
+                        dummy_tree_rank,
+                    );
 
-                let pb = &pbm.padding + &pbm.border;
-                let inline_start = match inline_axis.anchor {
-                    Anchor::Start(start) => start + pb.inline_start + margin.inline_start,
-                    Anchor::End(end) => {
-                        cbis - end - pb.inline_end - margin.inline_end - size.inline
-                    },
-                };
-                let block_start = match block_axis.anchor {
-                    Anchor::Start(start) => start + pb.block_start + margin.block_start,
-                    Anchor::End(end) => cbbs - end - pb.block_end - margin.block_end - size.block,
-                };
+                    content_size = Vec2 {
+                        inline: inline_size,
+                        block: block_axis
+                            .size
+                            .auto_is(|| independent_layout.content_block_size),
+                    };
+                    fragments = independent_layout.fragments
+                },
+            };
 
-                let content_rect = Rect {
-                    start_corner: Vec2 {
-                        inline: inline_start,
-                        block: block_start,
-                    },
-                    size,
-                };
+            let pb = &pbm.padding + &pbm.border;
+            let inline_start = match inline_axis.anchor {
+                Anchor::Start(start) => start + pb.inline_start + margin.inline_start,
+                Anchor::End(end) => {
+                    cbis - end - pb.inline_end - margin.inline_end - content_size.inline
+                },
+            };
+            let block_start = match block_axis.anchor {
+                Anchor::Start(start) => start + pb.block_start + margin.block_start,
+                Anchor::End(end) => {
+                    cbbs - end - pb.block_end - margin.block_end - content_size.block
+                },
+            };
 
-                BoxFragment::new(
-                    self.absolutely_positioned_box.contents.tag,
-                    style.clone(),
-                    fragments,
-                    content_rect,
-                    pbm.padding,
-                    pbm.border,
-                    margin,
-                    CollapsedBlockMargins::zero(),
-                )
-            },
-        )
+            let content_rect = Rect {
+                start_corner: Vec2 {
+                    inline: inline_start,
+                    block: block_start,
+                },
+                size: content_size,
+            };
+
+            BoxFragment::new(
+                absolutely_positioned_box.context.tag(),
+                absolutely_positioned_box.context.style().clone(),
+                fragments,
+                content_rect,
+                pbm.padding,
+                pbm.border,
+                margin,
+                CollapsedBlockMargins::zero(),
+            )
+        };
+        positioning_context.layout_collected_children(layout_context, &mut new_fragment);
+        for_nearest_containing_block_for_all_descendants
+            .extend(positioning_context.for_nearest_containing_block_for_all_descendants);
+        new_fragment
     }
 }
 
@@ -680,11 +691,13 @@ fn adjust_static_positions(
             _ => unreachable!(),
         };
 
-        if let AbsoluteBoxOffsets::StaticStart { start } = &mut abspos_fragment.box_offsets.inline {
+        let mut shared_fragment = abspos_fragment.fragment.borrow_mut();
+
+        if let AbsoluteBoxOffsets::StaticStart { start } = &mut shared_fragment.box_offsets.inline {
             *start += child_fragment_rect.start_corner.inline;
         }
 
-        if let AbsoluteBoxOffsets::StaticStart { start } = &mut abspos_fragment.box_offsets.block {
+        if let AbsoluteBoxOffsets::StaticStart { start } = &mut shared_fragment.box_offsets.block {
             *start += child_fragment_rect.start_corner.block;
         }
     }
@@ -705,10 +718,12 @@ pub(crate) fn relative_adjustement(
 ) -> Vec2<Length> {
     let cbis = containing_block.inline_size;
     let cbbs = containing_block.block_size.auto_is(Length::zero);
-    let box_offsets = style.box_offsets().map_inline_and_block_axes(
-        |v| v.percentage_relative_to(cbis),
-        |v| v.percentage_relative_to(cbbs),
-    );
+    let box_offsets = style
+        .box_offsets(containing_block)
+        .map_inline_and_block_axes(
+            |v| v.percentage_relative_to(cbis),
+            |v| v.percentage_relative_to(cbbs),
+        );
     fn adjust(start: LengthOrAuto, end: LengthOrAuto) -> Length {
         match (start, end) {
             (LengthOrAuto::Auto, LengthOrAuto::Auto) => Length::zero(),

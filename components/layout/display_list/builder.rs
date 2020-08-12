@@ -14,7 +14,9 @@ use crate::display_list::background::{self, get_cyclic};
 use crate::display_list::border;
 use crate::display_list::gradient;
 use crate::display_list::items::{self, BaseDisplayItem, ClipScrollNode};
-use crate::display_list::items::{ClipScrollNodeIndex, ClipScrollNodeType, ClippingAndScrolling};
+use crate::display_list::items::{
+    ClipScrollNodeIndex, ClipScrollNodeType, ClipType, ClippingAndScrolling,
+};
 use crate::display_list::items::{ClippingRegion, DisplayItem, DisplayItemMetadata, DisplayList};
 use crate::display_list::items::{CommonDisplayItem, DisplayListSection};
 use crate::display_list::items::{IframeDisplayItem, OpaqueNode};
@@ -61,7 +63,7 @@ use style::properties::{style_structs, ComputedValues};
 use style::servo::restyle_damage::ServoRestyleDamage;
 use style::values::computed::effects::SimpleShadow;
 use style::values::computed::image::Image;
-use style::values::computed::{ClipRectOrAuto, Gradient, LengthOrAuto};
+use style::values::computed::{ClipRectOrAuto, Gradient};
 use style::values::generics::background::BackgroundSize;
 use style::values::generics::image::PaintWorklet;
 use style::values::specified::ui::CursorKind;
@@ -70,7 +72,7 @@ use style_traits::ToCss;
 use webrender_api::units::{LayoutRect, LayoutTransform, LayoutVector2D};
 use webrender_api::{self, BorderDetails, BorderRadius, BorderSide, BoxShadowClipMode, ColorF};
 use webrender_api::{ColorU, ExternalScrollId, FilterOp, GlyphInstance, ImageRendering, LineStyle};
-use webrender_api::{NinePatchBorder, NinePatchBorderSource, NormalBorder};
+use webrender_api::{NinePatchBorder, NinePatchBorderSource, NormalBorder, PropertyBinding};
 use webrender_api::{ScrollSensitivity, StickyOffsetBounds};
 
 static THREAD_TINT_COLORS: [ColorF; 8] = [
@@ -424,15 +426,8 @@ impl<'a> DisplayListBuildState<'a> {
     }
 
     fn add_late_clip_node(&mut self, rect: LayoutRect, radii: BorderRadius) -> ClipScrollNodeIndex {
-        let mut clip = ClippingRegion::from_rect(rect);
-        clip.intersect_with_rounded_rect(rect, radii);
-
-        let node = ClipScrollNode {
-            parent_index: self.current_clipping_and_scrolling.scrolling,
-            clip,
-            content_rect: LayoutRect::zero(), // content_rect isn't important for clips.
-            node_type: ClipScrollNodeType::Clip,
-        };
+        let node =
+            ClipScrollNode::rounded(rect, radii, self.current_clipping_and_scrolling.scrolling);
 
         // We want the scroll root to be defined before any possible item that could use it,
         // so we make sure that it is added to the beginning of the parent "real" (non-pseudo)
@@ -721,8 +716,9 @@ impl Fragment {
             state.add_display_item(DisplayItem::Rectangle(CommonDisplayItem::new(
                 base,
                 webrender_api::RectangleDisplayItem {
-                    color: background_color.to_layout(),
+                    color: PropertyBinding::Value(background_color.to_layout()),
                     common: items::empty_common_item_properties(),
+                    bounds: bounds.to_layout(),
                 },
             )));
         });
@@ -1468,7 +1464,8 @@ impl Fragment {
                 base,
                 webrender_api::RectangleDisplayItem {
                     common: items::empty_common_item_properties(),
-                    color: background_color.to_layout(),
+                    color: PropertyBinding::Value(background_color.to_layout()),
+                    bounds: stacking_relative_border_box.to_layout(),
                 },
             )));
         }
@@ -1514,7 +1511,8 @@ impl Fragment {
             base,
             webrender_api::RectangleDisplayItem {
                 common: items::empty_common_item_properties(),
-                color: self.style().get_inherited_text().color.to_layout(),
+                color: PropertyBinding::Value(self.style().get_inherited_text().color.to_layout()),
+                bounds: insertion_point_bounds.to_layout(),
             },
         )));
     }
@@ -1570,6 +1568,11 @@ impl Fragment {
         overflow_content_size: Option<Size2D<Au>>,
     ) {
         if self.style().get_inherited_box().visibility != Visibility::Visible {
+            return;
+        }
+
+        // If this fragment takes up no space, we don't need to build any display items for it.
+        if self.has_non_invertible_transform() {
             return;
         }
 
@@ -1697,7 +1700,8 @@ impl Fragment {
                 base,
                 webrender_api::RectangleDisplayItem {
                     common: items::empty_common_item_properties(),
-                    color: ColorF::TRANSPARENT,
+                    color: PropertyBinding::Value(ColorF::TRANSPARENT),
+                    bounds: content_size.to_layout(),
                 },
             )));
         }
@@ -1733,8 +1737,18 @@ impl Fragment {
                 build_border_radius_for_inner_rect(stacking_relative_border_box, &self.style);
 
             if !radii.is_zero() {
-                let clip_id =
-                    state.add_late_clip_node(stacking_relative_border_box.to_layout(), radii);
+                // This is already calculated inside of build_border_radius_for_inner_rect(), it would be
+                // nice if it were only calculated once.
+                let border_widths = self
+                    .style
+                    .logical_border_width()
+                    .to_physical(self.style.writing_mode);
+                let clip_id = state.add_late_clip_node(
+                    stacking_relative_border_box
+                        .inner_rect(border_widths)
+                        .to_layout(),
+                    radii,
+                );
                 state.current_clipping_and_scrolling = ClippingAndScrolling::simple(clip_id);
             }
 
@@ -1891,6 +1905,7 @@ impl Fragment {
 
                 let image_key = match canvas_fragment_info.source {
                     CanvasFragmentSource::WebGL(image_key) => image_key,
+                    CanvasFragmentSource::WebGPU(image_key) => image_key,
                     CanvasFragmentSource::Image(ref ipc_renderer) => match *ipc_renderer {
                         Some(ref ipc_renderer) => {
                             let ipc_renderer = ipc_renderer.lock().unwrap();
@@ -2367,6 +2382,11 @@ impl BlockFlow {
         state: &mut StackingContextCollectionState,
         flags: StackingContextCollectionFlags,
     ) {
+        // This block flow produces no stacking contexts if it takes up no space.
+        if self.has_non_invertible_transform() {
+            return;
+        }
+
         let mut preserved_state = SavedStackingContextCollectionState::new(state);
 
         let stacking_context_type = self.stacking_context_type(flags);
@@ -2629,10 +2649,18 @@ impl BlockFlow {
             .to_physical(self.fragment.style.writing_mode);
         let clip_rect = border_box.inner_rect(border_widths);
 
-        let mut clip = ClippingRegion::from_rect(clip_rect.to_layout());
+        let clip = ClippingRegion::from_rect(clip_rect.to_layout());
         let radii = build_border_radius_for_inner_rect(border_box, &self.fragment.style);
         if !radii.is_zero() {
-            clip.intersect_with_rounded_rect(clip_rect.to_layout(), radii)
+            let node = ClipScrollNode::rounded(
+                clip_rect.to_layout(),
+                radii,
+                state.current_clipping_and_scrolling.scrolling,
+            );
+            let clip_id = state.add_clip_scroll_node(node);
+            let new_clipping_and_scrolling = ClippingAndScrolling::simple(clip_id);
+            self.base.clipping_and_scrolling = Some(new_clipping_and_scrolling);
+            state.current_clipping_and_scrolling = new_clipping_and_scrolling;
         }
 
         let content_size = self.base.overflow.scroll.origin + self.base.overflow.scroll.size;
@@ -2673,33 +2701,14 @@ impl BlockFlow {
             _ => return,
         }
 
-        fn extract_clip_component(p: &LengthOrAuto) -> Option<Au> {
-            match *p {
-                LengthOrAuto::Auto => None,
-                LengthOrAuto::LengthPercentage(ref length) => Some(Au::from(*length)),
-            }
-        }
-
-        let clip_origin = Point2D::new(
-            stacking_relative_border_box.origin.x +
-                extract_clip_component(&style_clip_rect.left).unwrap_or_default(),
-            stacking_relative_border_box.origin.y +
-                extract_clip_component(&style_clip_rect.top).unwrap_or_default(),
-        );
-        let right = extract_clip_component(&style_clip_rect.right)
-            .unwrap_or(stacking_relative_border_box.size.width);
-        let bottom = extract_clip_component(&style_clip_rect.bottom)
-            .unwrap_or(stacking_relative_border_box.size.height);
-        let clip_size = Size2D::new(right - clip_origin.x, bottom - clip_origin.y);
-
-        let clip_rect = Rect::new(clip_origin, clip_size);
+        let clip_rect = style_clip_rect.for_border_rect(stacking_relative_border_box);
         preserved_state.push_clip(state, clip_rect, self.positioning());
 
         let new_index = state.add_clip_scroll_node(ClipScrollNode {
             parent_index: self.clipping_and_scrolling().scrolling,
             clip: ClippingRegion::from_rect(clip_rect.to_layout()),
             content_rect: LayoutRect::zero(), // content_rect isn't important for clips.
-            node_type: ClipScrollNodeType::Clip,
+            node_type: ClipScrollNodeType::Clip(ClipType::Rect),
         });
 
         let new_indices = ClippingAndScrolling::new(new_index, new_index);

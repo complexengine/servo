@@ -14,13 +14,16 @@ use msg::constellation_msg::{BackgroundHangMonitorRegister, BrowsingContextId, P
 use net_traits::image_cache::ImageCache;
 use profile_traits::mem::ReportsChan;
 use script_traits::Painter;
-use script_traits::{ConstellationControlMsg, LayoutControlMsg, LayoutMsg as ConstellationMsg};
-use script_traits::{ScrollState, UntrustedNodeAddress, WindowSizeData};
+use script_traits::{
+    ConstellationControlMsg, LayoutControlMsg, LayoutMsg as ConstellationMsg, ScrollState,
+    WindowSizeData,
+};
 use servo_arc::Arc as ServoArc;
 use servo_atoms::Atom;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use style::animation::DocumentAnimationSet;
 use style::context::QuirksMode;
 use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
@@ -46,15 +49,6 @@ pub enum Msg {
 
     /// Get an RPC interface.
     GetRPC(Sender<Box<dyn LayoutRPC + Send>>),
-
-    /// Requests that the layout thread render the next frame of all animations.
-    TickAnimations(ImmutableOrigin),
-
-    /// Updates layout's timer for animation testing from script.
-    ///
-    /// The inner field is the number of *milliseconds* to advance, and the bool
-    /// field is whether animations should be force-ticked.
-    AdvanceClockMs(i32, bool, ImmutableOrigin),
 
     /// Requests that the layout thread measure its memory usage. The resulting reports are sent back
     /// via the supplied channel.
@@ -96,9 +90,6 @@ pub enum Msg {
 
     /// Send to layout the precise time when the navigation started.
     SetNavigationStart(u64),
-
-    /// Request the current number of animations that are running.
-    GetRunningAnimations(IpcSender<usize>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -124,6 +115,7 @@ pub enum QueryMsg {
     ResolvedStyleQuery(TrustedNodeAddress, Option<PseudoElement>, PropertyId),
     StyleQuery,
     ElementInnerTextQuery(TrustedNodeAddress),
+    ResolvedFontStyleQuery(TrustedNodeAddress, PropertyId, String),
     InnerWindowDimensionsQuery(BrowsingContextId),
 }
 
@@ -152,6 +144,7 @@ impl ReflowGoal {
                 QueryMsg::NodeScrollGeometryQuery(_) |
                 QueryMsg::NodeScrollIdQuery(_) |
                 QueryMsg::ResolvedStyleQuery(..) |
+                QueryMsg::ResolvedFontStyleQuery(..) |
                 QueryMsg::OffsetParentQuery(_) |
                 QueryMsg::StyleQuery => false,
             },
@@ -173,6 +166,7 @@ impl ReflowGoal {
                 QueryMsg::NodeScrollGeometryQuery(_) |
                 QueryMsg::NodeScrollIdQuery(_) |
                 QueryMsg::ResolvedStyleQuery(..) |
+                QueryMsg::ResolvedFontStyleQuery(..) |
                 QueryMsg::OffsetParentQuery(_) |
                 QueryMsg::InnerWindowDimensionsQuery(_) |
                 QueryMsg::StyleQuery => false,
@@ -192,8 +186,6 @@ pub struct Reflow {
 pub struct ReflowComplete {
     /// The list of images that were encountered that are in progress.
     pub pending_images: Vec<PendingImage>,
-    /// The list of nodes that initiated a CSS transition.
-    pub newly_animating_nodes: Vec<UntrustedNodeAddress>,
 }
 
 /// Information needed for a script-initiated reflow.
@@ -202,6 +194,8 @@ pub struct ScriptReflow {
     pub reflow_info: Reflow,
     /// The document node.
     pub document: TrustedNodeAddress,
+    /// The dirty root from which to restyle.
+    pub dirty_root: Option<TrustedNodeAddress>,
     /// Whether the document's stylesheets have changed since the last script reflow.
     pub stylesheets_changed: bool,
     /// The current window size.
@@ -216,6 +210,10 @@ pub struct ScriptReflow {
     pub origin: ImmutableOrigin,
     /// Restyle snapshot map.
     pub pending_restyles: Vec<(TrustedNodeAddress, PendingRestyle)>,
+    /// The current animation timeline value.
+    pub animation_timeline_value: f64,
+    /// The set of animations for this document.
+    pub animations: DocumentAnimationSet,
 }
 
 pub struct LayoutThreadInit {
@@ -224,7 +222,7 @@ pub struct LayoutThreadInit {
     pub is_parent: bool,
     pub layout_pair: (Sender<Msg>, Receiver<Msg>),
     pub pipeline_port: IpcReceiver<LayoutControlMsg>,
-    pub background_hang_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
+    pub background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     pub constellation_chan: IpcSender<ConstellationMsg>,
     pub script_chan: IpcSender<ConstellationControlMsg>,
     pub image_cache: Arc<dyn ImageCache>,

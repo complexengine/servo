@@ -20,6 +20,8 @@ use crate::dom::xrviewerpose::XRViewerPose;
 use dom_struct::dom_struct;
 use std::cell::Cell;
 use webxr_api::Frame;
+use webxr_api::LayerId;
+use webxr_api::SubImages;
 
 #[dom_struct]
 pub struct XRFrame {
@@ -59,6 +61,14 @@ impl XRFrame {
     pub fn get_pose(&self, space: &XRSpace) -> Option<ApiPose> {
         space.get_pose(&self.data)
     }
+
+    pub fn get_sub_images(&self, layer_id: LayerId) -> Option<&SubImages> {
+        self.data
+            .sub_images
+            .iter()
+            .filter(|sub_images| sub_images.layer_id == layer_id)
+            .next()
+    }
 }
 
 impl XRFrameMethods for XRFrame {
@@ -80,12 +90,22 @@ impl XRFrameMethods for XRFrame {
             return Err(Error::InvalidState);
         }
 
-        let pose = if let Some(pose) = reference.get_viewer_pose(&self.data) {
+        let to_base = if let Some(to_base) = reference.get_base_transform(&self.data) {
+            to_base
+        } else {
+            return Ok(None);
+        };
+        let viewer_pose = if let Some(pose) = self.data.pose.as_ref() {
             pose
         } else {
             return Ok(None);
         };
-        Ok(Some(XRViewerPose::new(&self.global(), &self.session, pose)))
+        Ok(Some(XRViewerPose::new(
+            &self.global(),
+            &self.session,
+            to_base,
+            viewer_pose,
+        )))
     }
 
     /// https://immersive-web.github.io/webxr/#dom-xrframe-getpose

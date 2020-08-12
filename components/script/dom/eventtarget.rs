@@ -150,6 +150,23 @@ pub enum CompiledEventListener {
 }
 
 impl CompiledEventListener {
+    #[allow(unsafe_code)]
+    pub fn associated_global(&self) -> DomRoot<GlobalScope> {
+        let obj = match self {
+            CompiledEventListener::Listener(listener) => listener.callback(),
+            CompiledEventListener::Handler(CommonEventHandler::EventHandler(handler)) => {
+                handler.callback()
+            },
+            CompiledEventListener::Handler(CommonEventHandler::ErrorEventHandler(handler)) => {
+                handler.callback()
+            },
+            CompiledEventListener::Handler(CommonEventHandler::BeforeUnloadEventHandler(
+                handler,
+            )) => handler.callback(),
+        };
+        unsafe { GlobalScope::from_object(obj) }
+    }
+
     // https://html.spec.whatwg.org/multipage/#the-event-handler-processing-algorithm
     pub fn call_or_handle_event(
         &self,
@@ -495,11 +512,11 @@ impl EventTarget {
         // Step 3.9
 
         let url_serialized = CString::new(handler.url.to_string()).unwrap();
-        let name = CString::new(&**ty).unwrap();
+        let name = CString::new(format!("on{}", &**ty)).unwrap();
 
         // Step 3.9, subsection ParameterList
-        static mut ARG_NAMES: [*const c_char; 1] = [b"event\0" as *const u8 as *const c_char];
-        static mut ERROR_ARG_NAMES: [*const c_char; 5] = [
+        const ARG_NAMES: &[*const c_char] = &[b"event\0" as *const u8 as *const c_char];
+        const ERROR_ARG_NAMES: &[*const c_char] = &[
             b"event\0" as *const u8 as *const c_char,
             b"source\0" as *const u8 as *const c_char,
             b"lineno\0" as *const u8 as *const c_char,
@@ -507,13 +524,7 @@ impl EventTarget {
             b"error\0" as *const u8 as *const c_char,
         ];
         let is_error = ty == &atom!("error") && self.is::<Window>();
-        let args = unsafe {
-            if is_error {
-                &ERROR_ARG_NAMES[..]
-            } else {
-                &ARG_NAMES[..]
-            }
-        };
+        let args = if is_error { ERROR_ARG_NAMES } else { ARG_NAMES };
 
         let cx = window.get_cx();
         let options = unsafe {

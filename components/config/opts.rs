@@ -5,7 +5,6 @@
 //! Configuration options for a single run of the servo application. Created
 //! from command line arguments.
 
-use crate::prefs::{self, PrefValue};
 use euclid::Size2D;
 use getopts::{Matches, Options};
 use servo_geometry::DeviceIndependentPixel;
@@ -37,8 +36,6 @@ pub struct Opts {
     ///    (`i.e. -p 5`).
     ///  - a file path to write profiling info to a TSV file upon Servo's termination.
     ///    (`i.e. -p out.tsv`).
-    ///  - an InfluxDB hostname to store profiling info upon Servo's termination.
-    ///    (`i.e. -p http://localhost:8086`)
     pub time_profiling: Option<OutputOptions>,
 
     /// When the profiler is enabled, this is an optional path to dump a self-contained HTML file
@@ -111,16 +108,12 @@ pub struct Opts {
     /// Periodically print out on which events script threads spend their processing time.
     pub profile_script_events: bool,
 
-    /// Enable all heartbeats for profiling.
-    pub profile_heartbeats: bool,
+    /// Port number to start a server to listen to remote Firefox devtools connections.
+    /// 0 for random port.
+    pub devtools_port: u16,
 
-    /// `None` to disable debugger or `Some` with a port number to start a server to listen to
-    /// remote Firefox debugger connections.
-    pub debugger_port: Option<u16>,
-
-    /// `None` to disable devtools or `Some` with a port number to start a server to listen to
-    /// remote Firefox devtools connections.
-    pub devtools_port: Option<u16>,
+    /// Start the devtools server at startup
+    pub devtools_server_enabled: bool,
 
     /// `None` to disable WebDriver or `Some` with a port number to start a server to listen to
     /// remote WebDriver commands.
@@ -212,6 +205,9 @@ pub struct Opts {
     /// Unminify Javascript.
     pub unminify_js: bool,
 
+    /// Directory path that was created with "unminify-js"
+    pub local_script_source: Option<String>,
+
     /// Print Progressive Web Metrics to console.
     pub print_pwm: bool,
 }
@@ -262,9 +258,6 @@ pub struct DebugOptions {
 
     /// Profile which events script threads spend their time on.
     pub profile_script_events: bool,
-
-    /// Enable all heartbeats for profiling.
-    pub profile_heartbeats: bool,
 
     /// Paint borders along fragment boundaries.
     pub show_fragment_borders: bool,
@@ -332,7 +325,6 @@ impl DebugOptions {
                 "dump-display-list-json" => self.dump_display_list_json = true,
                 "relayout-event" => self.relayout_event = true,
                 "profile-script-events" => self.profile_script_events = true,
-                "profile-heartbeats" => self.profile_heartbeats = true,
                 "show-fragment-borders" => self.show_fragment_borders = true,
                 "show-parallel-layout" => self.show_parallel_layout = true,
                 "trace-layout" => self.trace_layout = true,
@@ -397,10 +389,6 @@ fn print_debug_usage(app: &str) -> ! {
         "Enable profiling of script-related events.",
     );
     print_option(
-        "profile-heartbeats",
-        "Enable heartbeats for all thread categories.",
-    );
-    print_option(
         "show-fragment-borders",
         "Paint borders along fragment boundaries.",
     );
@@ -452,7 +440,6 @@ fn print_debug_usage(app: &str) -> ! {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum OutputOptions {
     /// Database connection config (hostname, name, user, pass)
-    DB(ServoUrl, Option<String>, Option<String>, Option<String>),
     FileName(String),
     Stdout(f64),
 }
@@ -493,8 +480,8 @@ pub fn default_opts() -> Opts {
         enable_subpixel_text_antialiasing: true,
         enable_canvas_antialiasing: true,
         trace_layout: false,
-        debugger_port: None,
-        devtools_port: None,
+        devtools_port: 0,
+        devtools_server_enabled: false,
         webdriver_port: None,
         initial_window_size: Size2D::new(1024, 740),
         multiprocess: false,
@@ -509,7 +496,6 @@ pub fn default_opts() -> Opts {
         dump_display_list_json: false,
         relayout_event: false,
         profile_script_events: false,
-        profile_heartbeats: false,
         disable_share_style_cache: false,
         style_sharing_stats: false,
         convert_mouse_to_touch: false,
@@ -525,6 +511,7 @@ pub fn default_opts() -> Opts {
         signpost: false,
         certificate_path: None,
         unminify_js: false,
+        local_script_source: None,
         print_pwm: false,
     }
 }
@@ -597,12 +584,6 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         "soft-fail",
         "Display about:failure on thread failure instead of exiting",
     );
-    opts.optflagopt(
-        "",
-        "remote-debugging-port",
-        "Start remote debugger server on port",
-        "2794",
-    );
     opts.optflagopt("", "devtools", "Start remote devtools server on port", "0");
     opts.optflagopt(
         "",
@@ -651,18 +632,6 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         "Run as a content process and connect to the given pipe",
         "servo-ipc-channel.abcdefg",
     );
-    opts.optmulti(
-        "",
-        "pref",
-        "A preference to set to enable",
-        "dom.bluetooth.enabled",
-    );
-    opts.optmulti(
-        "",
-        "pref",
-        "A preference to set to enable",
-        "dom.webgpu.enabled",
-    );
     opts.optflag("b", "no-native-titlebar", "Do not use native titlebar");
     opts.optflag("w", "webrender", "Use webrender backend");
     opts.optopt("G", "graphics", "Select graphics backend (gl or es2)", "gl");
@@ -679,6 +648,12 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
     opts.optopt("", "profiler-db-name", "Profiler database name", "");
     opts.optflag("", "print-pwm", "Print Progressive Web Metrics");
     opts.optopt("", "vslogger-level", "Visual Studio logger level", "Warn");
+    opts.optopt(
+        "",
+        "local-script-source",
+        "Directory root with unminified scripts",
+        "",
+    );
 
     let opt_match = match opts.parse(args) {
         Ok(m) => m,
@@ -743,12 +718,7 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
             Some(argument) => match argument.parse::<f64>() {
                 Ok(interval) => Some(OutputOptions::Stdout(interval)),
                 Err(_) => match ServoUrl::parse(&argument) {
-                    Ok(url) => Some(OutputOptions::DB(
-                        url,
-                        opt_match.opt_str("profiler-db-name"),
-                        opt_match.opt_str("profiler-db-user"),
-                        opt_match.opt_str("profiler-db-pass"),
-                    )),
+                    Ok(_) => panic!("influxDB isn't supported anymore"),
                     Err(_) => Some(OutputOptions::FileName(argument)),
                 },
             },
@@ -814,22 +784,22 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         bubble_inline_sizes_separately = true;
     }
 
-    let debugger_port = opt_match
-        .opt_default("remote-debugging-port", "2794")
-        .map(|port| {
-            port.parse().unwrap_or_else(|err| {
-                args_fail(&format!(
-                    "Error parsing option: --remote-debugging-port ({})",
-                    err
-                ))
+    let (devtools_enabled, devtools_port) = if opt_match.opt_present("devtools") {
+        let port = opt_match
+            .opt_str("devtools")
+            .map(|port| {
+                port.parse().unwrap_or_else(|err| {
+                    args_fail(&format!("Error parsing option: --devtools ({})", err))
+                })
             })
-        });
-
-    // Set default port 0 for a random port to be selected.
-    let devtools_port = opt_match.opt_default("devtools", "0").map(|port| {
-        port.parse()
-            .unwrap_or_else(|err| args_fail(&format!("Error parsing option: --devtools ({})", err)))
-    });
+            .unwrap_or(pref!(devtools.server.port));
+        (true, port as u16)
+    } else {
+        (
+            pref!(devtools.server.enabled),
+            pref!(devtools.server.port) as u16,
+        )
+    };
 
     let webdriver_port = opt_match.opt_default("webdriver", "7000").map(|port| {
         port.parse().unwrap_or_else(|err| {
@@ -894,10 +864,9 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         hard_fail: opt_match.opt_present("f") && !opt_match.opt_present("F"),
         bubble_inline_sizes_separately: bubble_inline_sizes_separately,
         profile_script_events: debug_options.profile_script_events,
-        profile_heartbeats: debug_options.profile_heartbeats,
         trace_layout: debug_options.trace_layout,
-        debugger_port: debugger_port,
         devtools_port: devtools_port,
+        devtools_server_enabled: devtools_enabled,
         webdriver_port: webdriver_port,
         initial_window_size: initial_window_size,
         multiprocess: opt_match.opt_present("M"),
@@ -931,20 +900,11 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         signpost: debug_options.signpost,
         certificate_path: opt_match.opt_str("certificate-path"),
         unminify_js: opt_match.opt_present("unminify-js"),
+        local_script_source: opt_match.opt_str("local-script-source"),
         print_pwm: opt_match.opt_present("print-pwm"),
     };
 
     set_options(opts);
-
-    // These must happen after setting the default options, since the prefs rely on
-    // on the resource path.
-    // Note that command line preferences have the highest precedence
-
-    prefs::add_user_prefs();
-
-    for pref in opt_match.opt_strs("pref").iter() {
-        parse_pref_from_command_line(pref);
-    }
 
     if let Some(layout_threads) = layout_threads {
         set_pref!(layout.threads, layout_threads as i64);
@@ -973,31 +933,6 @@ pub fn set_options(opts: Opts) {
 #[inline]
 pub fn get() -> RwLockReadGuard<'static, Opts> {
     OPTIONS.read().unwrap()
-}
-
-pub fn parse_pref_from_command_line(pref: &str) {
-    let split: Vec<&str> = pref.splitn(2, '=').collect();
-    let pref_name = split[0];
-    let pref_value = parse_cli_pref_value(split.get(1).cloned());
-    prefs::pref_map()
-        .set(pref_name, pref_value)
-        .expect(format!("Error setting preference: {}", pref).as_str());
-}
-
-fn parse_cli_pref_value(input: Option<&str>) -> PrefValue {
-    match input {
-        Some("true") | None => PrefValue::Bool(true),
-        Some("false") => PrefValue::Bool(false),
-        Some(string) => {
-            if let Some(int) = string.parse::<i64>().ok() {
-                PrefValue::Int(int)
-            } else if let Some(float) = string.parse::<f64>().ok() {
-                PrefValue::Float(float)
-            } else {
-                PrefValue::from(string)
-            }
-        },
-    }
 }
 
 pub fn parse_url_or_filename(cwd: &Path, input: &str) -> Result<ServoUrl, ()> {

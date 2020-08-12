@@ -505,17 +505,17 @@ interface mixin WebGL2RenderingContextOverloads
                      GLenum format, GLenum type, TexImageSource source); // May throw DOMException
 
   // WebGL2 entrypoints:
-  //[Throws]
-  //void texImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
-  //                GLint border, GLenum format, GLenum type, GLintptr pboOffset);
-  //[Throws]
-  //void texImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
-  //                GLint border, GLenum format, GLenum type,
-  //                TexImageSource source); // May throw DOMException
-  //[Throws]
-  //void texImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
-  //                GLint border, GLenum format, GLenum type, /*[AllowShared]*/ ArrayBufferView srcData,
-  //                GLuint srcOffset);
+  [Throws]
+  void texImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
+                  GLint border, GLenum format, GLenum type, GLintptr pboOffset);
+  [Throws]
+  void texImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
+                  GLint border, GLenum format, GLenum type,
+                  TexImageSource source); // May throw DOMException
+  [Throws]
+  void texImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
+                  GLint border, GLenum format, GLenum type, /*[AllowShared]*/ ArrayBufferView srcData,
+                  GLuint srcOffset);
 
   //[Throws]
   //void texSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,

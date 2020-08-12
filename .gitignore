@@ -6,7 +6,7 @@
 /.vs
 /android-toolchains
 /target
-/etc/layout-2020-regressions/regressions.html
+/tests/wpt/reftests-report/report.html
 /ports/android/bin
 /ports/android/libs
 /ports/android/local.properties
@@ -14,7 +14,6 @@
 /python/_virtualenv*
 /python/tidy/servo_tidy.egg-info
 /tests/wpt/sync
-*~
 *.pkl
 *.pyc
 *.swp
@@ -42,6 +41,10 @@ capture_webrender/
 # VSCode
 .vscode
 !/.vscode/extensions.json
+
+# Emacs
+*~
+*#*
 
 /unminified-js
 

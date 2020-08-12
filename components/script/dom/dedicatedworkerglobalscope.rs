@@ -22,6 +22,7 @@ use crate::dom::errorevent::ErrorEvent;
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::identityhub::Identities;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::worker::{TrustedWorkerAddress, Worker};
 use crate::dom::workerglobalscope::WorkerGlobalScope;
@@ -29,7 +30,8 @@ use crate::fetch::load_whole_resource;
 use crate::realms::{enter_realm, AlreadyInRealm, InRealm};
 use crate::script_runtime::ScriptThreadEventCategory::WorkerEvent;
 use crate::script_runtime::{
-    new_child_runtime, CommonScriptMsg, JSContext as SafeJSContext, Runtime, ScriptChan, ScriptPort,
+    new_child_runtime, CommonScriptMsg, ContextForRequestInterrupt, JSContext as SafeJSContext,
+    Runtime, ScriptChan, ScriptPort,
 };
 use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
 use crate::task_source::networking::NetworkingTaskSource;
@@ -48,13 +50,14 @@ use net_traits::image_cache::ImageCache;
 use net_traits::request::{CredentialsMode, Destination, ParserMetadata};
 use net_traits::request::{Referrer, RequestBuilder, RequestMode};
 use net_traits::IpcSend;
+use parking_lot::Mutex;
 use script_traits::{WorkerGlobalScopeInit, WorkerScriptLoadOrigin};
 use servo_rand::random;
 use servo_url::ServoUrl;
 use std::mem::replace;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use style::thread_state::{self, ThreadState};
 
 /// Set the `worker` field of a related DedicatedWorkerGlobalScope object to a particular
@@ -84,6 +87,12 @@ impl<'a> Drop for AutoWorkerReset<'a> {
     }
 }
 
+/// Messages sent from the owning global.
+pub enum DedicatedWorkerControlMsg {
+    /// Shutdown the worker.
+    Exit,
+}
+
 pub enum DedicatedWorkerScriptMsg {
     /// Standard message from a worker.
     CommonWorker(TrustedWorkerAddress, WorkerScriptMsg),
@@ -94,6 +103,7 @@ pub enum DedicatedWorkerScriptMsg {
 pub enum MixedMessage {
     FromWorker(DedicatedWorkerScriptMsg),
     FromDevtools(DevtoolScriptControlMsg),
+    FromControl(DedicatedWorkerControlMsg),
 }
 
 impl QueuedTaskConversion for DedicatedWorkerScriptMsg {
@@ -181,23 +191,32 @@ pub struct DedicatedWorkerGlobalScope {
     #[ignore_malloc_size_of = "Arc"]
     image_cache: Arc<dyn ImageCache>,
     browsing_context: Option<BrowsingContextId>,
+    /// A receiver of control messages,
+    /// currently only used to signal shutdown.
+    #[ignore_malloc_size_of = "Channels are hard"]
+    control_receiver: Receiver<DedicatedWorkerControlMsg>,
 }
 
 impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
     type WorkerMsg = DedicatedWorkerScriptMsg;
+    type ControlMsg = DedicatedWorkerControlMsg;
     type Event = MixedMessage;
 
     fn task_queue(&self) -> &TaskQueue<DedicatedWorkerScriptMsg> {
         &self.task_queue
     }
 
-    fn handle_event(&self, event: MixedMessage) {
-        self.handle_mixed_message(event);
+    fn handle_event(&self, event: MixedMessage) -> bool {
+        self.handle_mixed_message(event)
     }
 
     fn handle_worker_post_event(&self, worker: &TrustedWorkerAddress) -> Option<AutoWorkerReset> {
         let ar = AutoWorkerReset::new(&self, worker.clone());
         Some(ar)
+    }
+
+    fn from_control_msg(&self, msg: DedicatedWorkerControlMsg) -> MixedMessage {
+        MixedMessage::FromControl(msg)
     }
 
     fn from_worker_msg(&self, msg: DedicatedWorkerScriptMsg) -> MixedMessage {
@@ -206,6 +225,10 @@ impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
 
     fn from_devtools_msg(&self, msg: DevtoolScriptControlMsg) -> MixedMessage {
         MixedMessage::FromDevtools(msg)
+    }
+
+    fn control_receiver(&self) -> &Receiver<DedicatedWorkerControlMsg> {
+        &self.control_receiver
     }
 }
 
@@ -223,6 +246,8 @@ impl DedicatedWorkerGlobalScope {
         closing: Arc<AtomicBool>,
         image_cache: Arc<dyn ImageCache>,
         browsing_context: Option<BrowsingContextId>,
+        gpu_id_hub: Arc<Mutex<Identities>>,
+        control_receiver: Receiver<DedicatedWorkerControlMsg>,
     ) -> DedicatedWorkerGlobalScope {
         DedicatedWorkerGlobalScope {
             workerglobalscope: WorkerGlobalScope::new_inherited(
@@ -232,7 +257,8 @@ impl DedicatedWorkerGlobalScope {
                 worker_url,
                 runtime,
                 from_devtools_receiver,
-                Some(closing),
+                closing,
+                gpu_id_hub,
             ),
             task_queue: TaskQueue::new(receiver, own_sender.clone()),
             own_sender: own_sender,
@@ -240,6 +266,7 @@ impl DedicatedWorkerGlobalScope {
             worker: DomRefCell::new(None),
             image_cache: image_cache,
             browsing_context,
+            control_receiver,
         }
     }
 
@@ -257,6 +284,8 @@ impl DedicatedWorkerGlobalScope {
         closing: Arc<AtomicBool>,
         image_cache: Arc<dyn ImageCache>,
         browsing_context: Option<BrowsingContextId>,
+        gpu_id_hub: Arc<Mutex<Identities>>,
+        control_receiver: Receiver<DedicatedWorkerControlMsg>,
     ) -> DomRoot<DedicatedWorkerGlobalScope> {
         let cx = runtime.cx();
         let scope = Box::new(DedicatedWorkerGlobalScope::new_inherited(
@@ -272,6 +301,8 @@ impl DedicatedWorkerGlobalScope {
             closing,
             image_cache,
             browsing_context,
+            gpu_id_hub,
+            control_receiver,
         ));
         unsafe { DedicatedWorkerGlobalScopeBinding::Wrap(SafeJSContext::from_ptr(cx), scope) }
     }
@@ -292,13 +323,18 @@ impl DedicatedWorkerGlobalScope {
         closing: Arc<AtomicBool>,
         image_cache: Arc<dyn ImageCache>,
         browsing_context: Option<BrowsingContextId>,
-    ) {
+        gpu_id_hub: Arc<Mutex<Identities>>,
+        control_receiver: Receiver<DedicatedWorkerControlMsg>,
+        context_sender: Sender<ContextForRequestInterrupt>,
+    ) -> JoinHandle<()> {
         let serialized_worker_url = worker_url.to_string();
         let name = format!("WebWorker for {}", serialized_worker_url);
         let top_level_browsing_context_id = TopLevelBrowsingContextId::installed();
         let current_global = GlobalScope::current().expect("No current global object");
         let origin = current_global.origin().immutable().clone();
+        let referrer = current_global.get_referrer();
         let parent = current_global.runtime_handle();
+        let current_global_https_state = current_global.get_https_state();
 
         thread::Builder::new()
             .name(name)
@@ -318,16 +354,17 @@ impl DedicatedWorkerGlobalScope {
                     pipeline_id,
                 } = worker_load_origin;
 
-                let referrer = referrer_url.map(|referrer_url| Referrer::ReferrerUrl(referrer_url));
+                let referrer = referrer_url
+                    .map(|url| Referrer::ReferrerUrl(url))
+                    .unwrap_or(referrer);
 
-                let request = RequestBuilder::new(worker_url.clone())
+                let request = RequestBuilder::new(worker_url.clone(), referrer)
                     .destination(Destination::Worker)
                     .mode(RequestMode::SameOrigin)
                     .credentials_mode(CredentialsMode::CredentialsSameOrigin)
                     .parser_metadata(ParserMetadata::NotParserInserted)
                     .use_url_credentials(true)
                     .pipeline_id(Some(pipeline_id))
-                    .referrer(referrer)
                     .referrer_policy(referrer_policy)
                     .origin(origin);
 
@@ -341,6 +378,8 @@ impl DedicatedWorkerGlobalScope {
                     );
                     new_child_runtime(parent, Some(task_source))
                 };
+
+                let _ = context_sender.send(ContextForRequestInterrupt::new(runtime.cx()));
 
                 let (devtools_mpsc_chan, devtools_mpsc_port) = unbounded();
                 ROUTER.route_ipc_receiver_to_crossbeam_sender(
@@ -361,11 +400,15 @@ impl DedicatedWorkerGlobalScope {
                     closing,
                     image_cache,
                     browsing_context,
+                    gpu_id_hub,
+                    control_receiver,
                 );
                 // FIXME(njn): workers currently don't have a unique ID suitable for using in reporter
                 // registration (#6631), so we instead use a random number and cross our fingers.
                 let scope = global.upcast::<WorkerGlobalScope>();
                 let global_scope = global.upcast::<GlobalScope>();
+
+                global_scope.set_https_state(current_global_https_state);
 
                 let (metadata, bytes) = match load_whole_resource(
                     request,
@@ -387,6 +430,7 @@ impl DedicatedWorkerGlobalScope {
                     Ok((metadata, bytes)) => (metadata, bytes),
                 };
                 scope.set_url(metadata.final_url);
+                global_scope.set_https_state(metadata.https_state);
                 let source = String::from_utf8_lossy(&bytes);
 
                 unsafe {
@@ -422,8 +466,9 @@ impl DedicatedWorkerGlobalScope {
                         parent_sender,
                         CommonScriptMsg::CollectReports,
                     );
+                scope.clear_js_runtime();
             })
-            .expect("Thread spawning failed");
+            .expect("Thread spawning failed")
     }
 
     pub fn image_cache(&self) -> Arc<dyn ImageCache> {
@@ -473,7 +518,7 @@ impl DedicatedWorkerGlobalScope {
         }
     }
 
-    fn handle_mixed_message(&self, msg: MixedMessage) {
+    fn handle_mixed_message(&self, msg: MixedMessage) -> bool {
         // FIXME(#26324): `self.worker` is None in devtools messages.
         match msg {
             MixedMessage::FromDevtools(msg) => match msg {
@@ -493,7 +538,11 @@ impl DedicatedWorkerGlobalScope {
                 self.handle_script_event(msg);
             },
             MixedMessage::FromWorker(DedicatedWorkerScriptMsg::WakeUp) => {},
+            MixedMessage::FromControl(DedicatedWorkerControlMsg::Exit) => {
+                return false;
+            },
         }
+        true
     }
 
     // https://html.spec.whatwg.org/multipage/#runtime-script-errors-2

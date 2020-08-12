@@ -4,9 +4,10 @@
 
 use crate::context::LayoutContext;
 use crate::display_list::conversions::ToWebRender;
-use crate::fragments::{BoxFragment, Fragment, TextFragment};
+use crate::fragments::{BoxFragment, Fragment, Tag, TextFragment};
 use crate::geom::{PhysicalPoint, PhysicalRect};
 use crate::replaced::IntrinsicSizes;
+use crate::style_ext::ComputedValuesExt;
 use embedder_traits::Cursor;
 use euclid::{Point2D, SideOffsets2D, Size2D};
 use gfx::text::glyph::GlyphStore;
@@ -15,6 +16,7 @@ use net_traits::image_cache::UsePlaceholder;
 use std::sync::Arc;
 use style::computed_values::text_decoration_style::T as ComputedTextDecorationStyle;
 use style::dom::OpaqueNode;
+use style::properties::longhands::visibility::computed_value::T as Visibility;
 use style::properties::ComputedValues;
 use style::values::computed::{BorderStyle, Length, LengthPercentage};
 use style::values::specified::text::TextDecorationLine;
@@ -41,6 +43,7 @@ pub struct DisplayListBuilder<'a> {
     /// The current SpatialId and ClipId information for this `DisplayListBuilder`.
     current_space_and_clip: wr::SpaceAndClipInfo,
 
+    element_for_canvas_background: OpaqueNode,
     pub context: &'a LayoutContext<'a>,
     pub wr: wr::DisplayListBuilder,
 
@@ -55,19 +58,32 @@ impl<'a> DisplayListBuilder<'a> {
     pub fn new(
         pipeline_id: wr::PipelineId,
         context: &'a LayoutContext,
-        viewport_size: wr::units::LayoutSize,
+        fragment_tree: &crate::FragmentTree,
     ) -> Self {
         Self {
             current_space_and_clip: wr::SpaceAndClipInfo::root_scroll(pipeline_id),
+            element_for_canvas_background: fragment_tree.canvas_background.from_element,
             is_contentful: false,
             context,
-            wr: wr::DisplayListBuilder::new(pipeline_id, viewport_size),
+            wr: wr::DisplayListBuilder::new(pipeline_id, fragment_tree.scrollable_overflow()),
         }
     }
 
-    fn common_properties(&self, clip_rect: units::LayoutRect) -> wr::CommonItemProperties {
-        // TODO(gw): Make use of the WR backface visibility functionality.
-        wr::CommonItemProperties::new(clip_rect, self.current_space_and_clip)
+    fn common_properties(
+        &self,
+        clip_rect: units::LayoutRect,
+        style: &ComputedValues,
+    ) -> wr::CommonItemProperties {
+        // TODO(mrobinson): We should take advantage of this field to pass hit testing
+        // information. This will allow us to avoid creating hit testing display items
+        // for fragments that paint their entire border rectangle.
+        wr::CommonItemProperties {
+            clip_rect,
+            spatial_id: self.current_space_and_clip.spatial_id,
+            clip_id: self.current_space_and_clip.clip_id,
+            hit_info: None,
+            flags: style.get_webrender_primitive_flags(),
+        }
     }
 }
 
@@ -78,28 +94,42 @@ impl Fragment {
         containing_block: &PhysicalRect<Length>,
     ) {
         match self {
-            Fragment::Box(b) => BuilderForBoxFragment::new(b, containing_block).build(builder),
+            Fragment::Box(b) => match b.style.get_inherited_box().visibility {
+                Visibility::Visible => {
+                    BuilderForBoxFragment::new(b, containing_block).build(builder)
+                },
+                Visibility::Hidden => (),
+                Visibility::Collapse => (),
+            },
             Fragment::AbsoluteOrFixedPositioned(_) => {},
             Fragment::Anonymous(_) => {},
-            Fragment::Image(i) => {
-                builder.is_contentful = true;
-                let rect = i
-                    .rect
-                    .to_physical(i.style.writing_mode, containing_block)
-                    .translate(containing_block.origin.to_vector());
+            Fragment::Image(i) => match i.style.get_inherited_box().visibility {
+                Visibility::Visible => {
+                    builder.is_contentful = true;
+                    let rect = i
+                        .rect
+                        .to_physical(i.style.writing_mode, containing_block)
+                        .translate(containing_block.origin.to_vector());
 
-                let common = builder.common_properties(rect.clone().to_webrender());
-                builder.wr.push_image(
-                    &common,
-                    rect.to_webrender(),
-                    image_rendering(i.style.get_inherited_box().image_rendering),
-                    wr::AlphaType::PremultipliedAlpha,
-                    i.image_key,
-                    wr::ColorF::WHITE,
-                );
+                    let common = builder.common_properties(rect.to_webrender(), &i.style);
+                    builder.wr.push_image(
+                        &common,
+                        rect.to_webrender(),
+                        image_rendering(i.style.get_inherited_box().image_rendering),
+                        wr::AlphaType::PremultipliedAlpha,
+                        i.image_key,
+                        wr::ColorF::WHITE,
+                    );
+                },
+                Visibility::Hidden => (),
+                Visibility::Collapse => (),
             },
-            Fragment::Text(t) => {
-                self.build_display_list_for_text_fragment(t, builder, containing_block)
+            Fragment::Text(t) => match t.parent_style.get_inherited_box().visibility {
+                Visibility::Visible => {
+                    self.build_display_list_for_text_fragment(t, builder, containing_block)
+                },
+                Visibility::Hidden => (),
+                Visibility::Collapse => (),
             },
         }
     }
@@ -126,7 +156,7 @@ impl Fragment {
             return;
         }
 
-        let mut common = builder.common_properties(rect.to_webrender());
+        let mut common = builder.common_properties(rect.to_webrender(), &fragment.parent_style);
         common.hit_info = hit_info(&fragment.parent_style, fragment.tag, Cursor::Text);
 
         let color = fragment.parent_style.clone_color();
@@ -194,7 +224,7 @@ impl Fragment {
             return;
         }
         builder.wr.push_line(
-            &builder.common_properties(rect),
+            &builder.common_properties(rect, &fragment.parent_style),
             &rect,
             wavy_line_thickness,
             wr::LineOrientation::Horizontal,
@@ -323,7 +353,7 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn build_hit_test(&self, builder: &mut DisplayListBuilder) {
         let hit_info = hit_info(&self.fragment.style, self.fragment.tag, Cursor::Default);
         if hit_info.is_some() {
-            let mut common = builder.common_properties(self.border_rect);
+            let mut common = builder.common_properties(self.border_rect, &self.fragment.style);
             common.hit_info = hit_info;
             if let Some(clip_id) = self.border_edge_clip(builder) {
                 common.clip_id = clip_id
@@ -333,17 +363,40 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 
     fn build_background(&mut self, builder: &mut DisplayListBuilder) {
-        use style::values::computed::image::Image;
-        let b = self.fragment.style.get_background();
-        let background_color = self.fragment.style.resolve_color(b.background_color);
+        if self.fragment.tag.node() == builder.element_for_canvas_background {
+            // This background is already painted for the canvas, don’t paint it again here.
+            return;
+        }
+
+        let source = background::Source::Fragment;
+        let style = &self.fragment.style;
+        let b = style.get_background();
+        let background_color = style.resolve_color(b.background_color);
         if background_color.alpha > 0 {
             // https://drafts.csswg.org/css-backgrounds/#background-color
             // “The background color is clipped according to the background-clip
             //  value associated with the bottom-most background image layer.”
             let layer_index = b.background_image.0.len() - 1;
-            let (_, common) = background::painting_area(self, builder, layer_index);
-            builder.wr.push_rect(&common, rgba(background_color))
+            let (bounds, common) = background::painting_area(self, &source, builder, layer_index);
+            builder
+                .wr
+                .push_rect(&common, *bounds, rgba(background_color))
         }
+
+        self.build_background_image(builder, source);
+    }
+
+    fn build_background_image(
+        &mut self,
+        builder: &mut DisplayListBuilder,
+        source: background::Source<'a>,
+    ) {
+        use style::values::computed::image::Image;
+        let style = match source {
+            background::Source::Canvas { style, .. } => style,
+            background::Source::Fragment => &self.fragment.style,
+        };
+        let b = style.get_background();
         // Reverse because the property is top layer first, we want to paint bottom layer first.
         for (index, image) in b.background_image.0.iter().enumerate().rev() {
             match image {
@@ -354,9 +407,10 @@ impl<'a> BuilderForBoxFragment<'a> {
                         height: None,
                         ratio: None,
                     };
-                    if let Some(layer) = &background::layout_layer(self, builder, index, intrinsic)
+                    if let Some(layer) =
+                        &background::layout_layer(self, &source, builder, index, intrinsic)
                     {
-                        gradient::build(&self.fragment.style, &gradient, layer, builder)
+                        gradient::build(&style, &gradient, layer, builder)
                     }
                 },
                 Image::Url(ref image_url) => {
@@ -366,7 +420,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                     let (width, height, key) = match image_url.url() {
                         Some(url) => {
                             match builder.context.get_webrender_image_for_url(
-                                self.fragment.tag,
+                                self.fragment.tag.node(),
                                 url.clone(),
                                 UsePlaceholder::No,
                             ) {
@@ -391,9 +445,10 @@ impl<'a> BuilderForBoxFragment<'a> {
                         ratio: Some(width as f32 / height as f32),
                     };
 
-                    if let Some(layer) = background::layout_layer(self, builder, index, intrinsic) {
-                        let image_rendering =
-                            image_rendering(self.fragment.style.clone_image_rendering());
+                    if let Some(layer) =
+                        background::layout_layer(self, &source, builder, index, intrinsic)
+                    {
+                        let image_rendering = image_rendering(style.clone_image_rendering());
                         if layer.repeat {
                             builder.wr.push_repeating_image(
                                 &layer.common,
@@ -449,7 +504,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                 BorderStyle::Outset => wr::BorderStyle::Outset,
             },
         };
-        let common = builder.common_properties(self.border_rect);
+        let common = builder.common_properties(self.border_rect, &self.fragment.style);
         let details = wr::BorderDetails::Normal(wr::NormalBorder {
             top: side(b.border_top_style, b.border_top_color),
             right: side(b.border_right_style, b.border_right_color),
@@ -501,7 +556,7 @@ fn glyphs(
     glyphs
 }
 
-fn hit_info(style: &ComputedValues, tag: OpaqueNode, auto_cursor: Cursor) -> HitInfo {
+fn hit_info(style: &ComputedValues, tag: Tag, auto_cursor: Cursor) -> HitInfo {
     use style::computed_values::pointer_events::T as PointerEvents;
 
     let inherited_ui = style.get_inherited_ui();
@@ -509,7 +564,7 @@ fn hit_info(style: &ComputedValues, tag: OpaqueNode, auto_cursor: Cursor) -> Hit
         None
     } else {
         let cursor = cursor(inherited_ui.cursor.keyword, auto_cursor);
-        Some((tag.0 as u64, cursor as u16))
+        Some((tag.node().0 as u64, cursor as u16))
     }
 }
 
@@ -587,15 +642,13 @@ fn clip_for_radii(
     if radii.is_zero() {
         None
     } else {
-        Some(builder.wr.define_clip(
+        Some(builder.wr.define_clip_rounded_rect(
             &builder.current_space_and_clip,
-            rect,
-            Some(wr::ComplexClipRegion {
+            wr::ComplexClipRegion {
                 rect,
                 radii,
                 mode: wr::ClipMode::Clip,
-            }),
-            None,
+            },
         ))
     }
 }

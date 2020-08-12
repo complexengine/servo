@@ -896,6 +896,19 @@
       {}
      ]
     ],
+    "border-radius-image.html": [
+     "2e30ba4bcb40b0fd50ae2c35992e06423720b26e",
+     [
+      null,
+      [
+       [
+        "/_mozilla/css/border-radius-image-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
     "border_black_groove.html": [
      "49e1647a6f71e320770225ad537b4fd4020bd700",
      [
@@ -6067,6 +6080,19 @@
       {}
      ]
     ],
+    "stacking-context-empty.html": [
+     "952c73f1680805dc3a976446bb509cb924a6a702",
+     [
+      null,
+      [
+       [
+        "/_mozilla/css/stacking-context-empty-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
     "stacking_context_overflow_a.html": [
      "dc379afb77977b0e99a0a8ce3321c9afff236a37",
      [
@@ -8057,7 +8083,7 @@
      ]
     ],
     "scroll_root.html": [
-     "5896eb3957da1eb85a26680053823d3f3bf9af49",
+     "b1a9cb590b0fcce9c883f99e17fa029a999b699b",
      [
       null,
       [
@@ -8668,6 +8694,10 @@
     ],
     "border-image-linear-gradient-ref.html": [
      "0dddcf89d26d6ac1efe7b0d65e5607a3ed771b46",
+     []
+    ],
+    "border-radius-image-ref.html": [
+     "3aa9bea5a48a4d809fabf1108049a24365edb07f",
      []
     ],
     "border_black_solid.html": [
@@ -10294,6 +10324,10 @@
      "0525bab6b11800d29f90efc7efef0f43165fba01",
      []
     ],
+    "stacking-context-empty-ref.html": [
+     "8006e2413694b0776f000d3b8138bed29812b7cd",
+     []
+    ],
     "stacking_context_overflow_ref.html": [
      "49991c449ab4f42afae6f512a7f184e70d77bc34",
      []
@@ -10851,7 +10885,7 @@
      []
     ]
    },
-   "lint.whitelist": [
+   "lint.ignore": [
     "314a9e5b44443be1a4e28dd3c5047a5082a7ccab",
     []
    ],
@@ -10971,7 +11005,7 @@
      []
     ],
     "interfaces.js": [
-     "1b841f053a231bf78d29ffe68e59455363c61502",
+     "7a105e791dd80bd42d80055a64746bbe5fece41e",
      []
     ],
     "nested_asap_script.js": [
@@ -11085,7 +11119,7 @@
      []
     ],
     "scroll_root_ref.html": [
-     "c7d4cfec7b9d9b5daf32841172721ddac3e4d071",
+     "6503ad5d5265c0698f61fc607e2e4e017b31cb6f",
      []
     ],
     "scrolling_div_background_borders_background.png": [
@@ -11214,6 +11248,10 @@
       []
      ]
     },
+    "websocket_disconnect_worker.js": [
+     "b8b61957913572b0b121b0aa77c2ec247235fcaa",
+     []
+    ],
     "worker_member_test.js": [
      "abca5cd280ac07914cb21ee4968ac4d27e7feb68",
      []
@@ -12832,6 +12870,29 @@
    },
    "css": {
     "animations": {
+     "animation-delay.html": [
+      "f54cf2b9bca93e82b177243b9d754e4ae3bf15fa",
+      [
+       null,
+       {}
+      ]
+     ],
+     "animation-events.html": [
+      "0975aa64ec47ca4b4c8fc1e0a40414a51719ad67",
+      [
+       null,
+       {
+        "timeout": "long"
+       }
+      ]
+     ],
+     "animation-fill-mode.html": [
+      "ac3062879af9836768890d653f4b29b6165b6a45",
+      [
+       null,
+       {}
+      ]
+     ],
      "basic-linear-width.html": [
       "634b09dca5924b8bea58ac8532d9d46c20d8a0ad",
       [
@@ -12846,6 +12907,13 @@
        {}
       ]
      ],
+     "faster-reversing-of-transitions.html": [
+      "e646a06405d3f32b37e94f797f7a99c6ca54254b",
+      [
+       null,
+       {}
+      ]
+     ],
      "mixed-units.html": [
       "bb029a9fa80650c39e3f9524748e2b8893a476e1",
       [
@@ -12853,8 +12921,15 @@
        {}
       ]
      ],
+     "transition-events.html": [
+      "b561fc8353276e6bdd13a9d1b965f57733ecd19b",
+      [
+       null,
+       {}
+      ]
+     ],
      "transition-raf.html": [
-      "6159bb9ab333544b4485d11025889ee94186c7eb",
+      "c38404503408e04b3c75b42df18ec3a7ec0819f5",
       [
        null,
        {}
@@ -13286,8 +13361,22 @@
       {}
      ]
     ],
+    "detached_layout.html": [
+     "b9fe090cc29c147f493732327e36b06702c4f846",
+     [
+      null,
+      {}
+     ]
+    ],
     "deterministic-raf.html": [
      "441664829a14379ebc92306f42ab0bad6581257e",
+     [
+      null,
+      {}
+     ]
+    ],
+    "dictionary_to_jsval.html": [
+     "e31a7e5cfaa0635d41ab2adac96318b574c58a10",
      [
       null,
       {}
@@ -13870,14 +13959,14 @@
      ]
     ],
     "interfaces.html": [
-     "b6034be26af3c2edd1ef41703857fa99bd2cd639",
+     "b58b16ca333f9e00afade02c2ac60689ee7eef3a",
      [
       null,
       {}
      ]
     ],
     "interfaces.worker.js": [
-     "a74a91489541ab99ae58001e3f63afc9ecc5c553",
+     "59d4aa1855fbf281736b28581fbc519a847c8a0d",
      [
       "mozilla/interfaces.worker.html",
       {}
@@ -14151,6 +14240,13 @@
       {}
      ]
     ],
+    "promise-no-incumbent.html": [
+     "a5458d096b5da8d6619ef5c553f232261887f45a",
+     [
+      null,
+      {}
+     ]
+    ],
     "promise.html": [
      "5925047287175f291c07ee88075359ed92a86e6a",
      [
@@ -14274,7 +14370,7 @@
     ],
     "service-workers": {
      "service-worker-registration.https.html": [
-      "949992e45de6858c336936b4f1ea4bca76db1d91",
+      "04d74fb5c582a3fef8dc589868f0b8c3e402eab2",
       [
        null,
        {}
@@ -14513,6 +14609,13 @@
       {}
      ]
     ],
+    "websocket_disconnect.html": [
+     "797342743a4bc69d6c8748d0f2dd6841566e6ca5",
+     [
+      null,
+      {}
+     ]
+    ],
     "window-postmessage-sameorigin.html": [
      "cb3bc26e8821b73bcee0455c765362ab731bf3fa",
      [
@@ -14615,8 +14718,15 @@
       {}
      ]
     ],
+    "layerevents.html": [
+     "6a0319366ec842a9b94d5897978975ebe3eb6f7f",
+     [
+      null,
+      {}
+     ]
+    ],
     "layers.html": [
-     "49821d7661f92bc9cf22232d3fcb391c2cdc7295",
+     "b6749f208a8f3c5ae78fbe72cfa7364829abb127",
      [
       null,
       {}
@@ -14624,6 +14734,13 @@
     ],
     "obtain_frame.html": [
      "d9ff25729f9cdfd348e7c9914ce2dacd231e13a0",
+     [
+      null,
+      {}
+     ]
+    ],
+    "sessionavailable.html": [
+     "dd9a071d05c4d696471be87428c12cea573cba60",
      [
       null,
       {}

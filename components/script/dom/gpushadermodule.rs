@@ -6,7 +6,7 @@ use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::GPUShaderModuleBinding::GPUShaderModuleMethods;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use dom_struct::dom_struct;
 use webgpu::WebGPUShaderModule;
@@ -14,15 +14,15 @@ use webgpu::WebGPUShaderModule;
 #[dom_struct]
 pub struct GPUShaderModule {
     reflector_: Reflector,
-    label: DomRefCell<Option<DOMString>>,
+    label: DomRefCell<Option<USVString>>,
     shader_module: WebGPUShaderModule,
 }
 
 impl GPUShaderModule {
-    fn new_inherited(shader_module: WebGPUShaderModule) -> GPUShaderModule {
+    fn new_inherited(shader_module: WebGPUShaderModule, label: Option<USVString>) -> Self {
         Self {
             reflector_: Reflector::new(),
-            label: DomRefCell::new(None),
+            label: DomRefCell::new(label),
             shader_module,
         }
     }
@@ -30,9 +30,10 @@ impl GPUShaderModule {
     pub fn new(
         global: &GlobalScope,
         shader_module: WebGPUShaderModule,
-    ) -> DomRoot<GPUShaderModule> {
+        label: Option<USVString>,
+    ) -> DomRoot<Self> {
         reflect_dom_object(
-            Box::new(GPUShaderModule::new_inherited(shader_module)),
+            Box::new(GPUShaderModule::new_inherited(shader_module, label)),
             global,
         )
     }
@@ -46,12 +47,12 @@ impl GPUShaderModule {
 
 impl GPUShaderModuleMethods for GPUShaderModule {
     /// https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label
-    fn GetLabel(&self) -> Option<DOMString> {
+    fn GetLabel(&self) -> Option<USVString> {
         self.label.borrow().clone()
     }
 
     /// https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label
-    fn SetLabel(&self, value: Option<DOMString>) {
+    fn SetLabel(&self, value: Option<USVString>) {
         *self.label.borrow_mut() = value;
     }
 }

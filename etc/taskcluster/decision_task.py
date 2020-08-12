@@ -260,12 +260,13 @@ def layout_2020_regressions_report():
         .with_dockerfile(dockerfile_path("base"))
         .with_repo_bundle()
         .with_script(
-            "python3 etc/layout-2020-regressions/gen.py %s %s"
+            "python3 tests/wpt/reftests-report/gen.py %s %s"
             % (CONFIG.tree_hash(), CONFIG.git_sha)
         )
         .with_index_and_artifacts_expire_in(log_artifacts_expire_in)
-        .with_artifacts("/repo/etc/layout-2020-regressions/regressions.html")
-        .find_or_create("layout-2020-regressions-report")
+        .with_artifacts("/repo/tests/wpt/reftests-report/report.html")
+        .with_index_at("layout-2020-regressions-report")
+        .create()
     )
 
 def macos_unit():
@@ -276,6 +277,7 @@ def macos_unit():
             ./mach build --dev --verbose
             ./mach test-unit
             ./mach package --dev
+            ./etc/ci/macos_package_smoketest.sh target/debug/servo-tech-demo.dmg
             ./etc/ci/lockfile_changed.sh
         """)
         .find_or_create("macos_unit." + CONFIG.tree_hash())
@@ -450,6 +452,7 @@ def macos_nightly():
         .with_script(
             "./mach build --release",
             "./mach package --release",
+            "./etc/ci/macos_package_smoketest.sh target/release/servo-tech-demo.dmg",
             "./mach upload-nightly mac --secret-from-taskcluster",
         )
         .with_artifacts("repo/target/release/servo-tech-demo.dmg")
@@ -491,6 +494,8 @@ def macos_release_build_with_debug_assertions(priority=None):
             "./etc/ci/lockfile_changed.sh",
             "tar -czf target.tar.gz" +
             " target/release/servo" +
+            " target/release/*.so" +
+            " target/release/*.dylib" +
             " resources",
         ]))
         .with_artifacts("repo/target.tar.gz")
@@ -544,6 +549,7 @@ def macos_wpt():
         repo_dir="repo",
         total_chunks=20,
         processes=8,
+        run_webgpu=True,
     )
 
 
@@ -564,7 +570,7 @@ def linux_wpt_common(total_chunks, layout_2020):
 
 
 def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
-               repo_dir, chunks="all", layout_2020=False):
+               repo_dir, chunks="all", layout_2020=False, run_webgpu=False):
     if layout_2020:
         start = 1  # Skip the "extra" WPT testing, a.k.a. chunk 0
         name_prefix = "Layout 2020 "
@@ -613,6 +619,22 @@ def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
         # and wptrunner does not use "interactive mode" formatting:
         # https://github.com/servo/servo/issues/22438
         if this_chunk == 0:
+            if run_webgpu:
+                webgpu_script = """
+                    time ./mach test-wpt _webgpu --release --processes $PROCESSES \
+                        --headless --log-raw test-webgpu.log \
+                        --log-errorsummary webgpu-errorsummary.log \
+                        | cat
+                    ./mach filter-intermittents \
+                        webgpu-errorsummary.log \
+                        --log-intermittents webgpu-intermittents.log \
+                        --log-filteredsummary filtered-webgpu-errorsummary.log \
+                        --tracker-api default \
+                        --reporter-api default
+                """
+            else:
+                webgpu_script = ""
+
             task.with_script("""
                 time python ./mach test-wpt --release --binary-arg=--multiprocess \
                     --processes $PROCESSES \
@@ -620,11 +642,11 @@ def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
                     --log-errorsummary wpt-mp-errorsummary.log \
                     eventsource \
                     | cat
-                time env PYTHONIOENCODING=utf-8 python3 ./mach test-wpt --release --binary-arg=--multiprocess \
+                time env PYTHONIOENCODING=utf-8 python3 ./mach test-wpt --release \
                     --processes $PROCESSES \
-                    --log-raw test-wpt-mp.log \
-                    --log-errorsummary wpt-mp-errorsummary.log \
-                    eventsource \
+                    --log-raw test-wpt-py3.log \
+                    --log-errorsummary wpt-py3-errorsummary.log \
+                    url \
                     | cat
                 time ./mach test-wpt --release --product=servodriver --headless  \
                     tests/wpt/mozilla/tests/mozilla/DOMParser.html \
@@ -649,7 +671,8 @@ def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
                     --log-filteredsummary filtered-wdspec-errorsummary.log \
                     --tracker-api default \
                     --reporter-api default
-            """)
+                """ + webgpu_script
+            )
         else:
             task.with_script("""
                 ./mach test-wpt \
@@ -749,16 +772,16 @@ def linux_build_task(name, *, build_env=build_env):
 def windows_build_task(name, package=True, arch="x86_64", rdp=False):
     hashes = {
         "devel": {
-            "x86_64": "c136cbfb0330041d52fe6ec4e3e468563176333c857f6ed71191ebc37fc9d605",
+            "x86_64": "bd444f3ff9d828f93ba5db0ef511d648d238fff50c4435ccefc7b3e9b2bea3b9",
         },
         "non-devel": {
-            "x86_64": "0744a8ef2a4ba393dacb7927d741df871400a85bab5aecf7905f63bf52c405e4",
+            "x86_64": "f33fff17a558a433b9c4cf7bd9a338a3d0867fa2d5ee1ee33d249b6a55e8a297",
         },
     }
     prefix = {
         "x86_64": "msvc",
     }
-    version = "1.16.0"
+    version = "1.16.2"
     task = (
         windows_task(name)
         .with_max_run_time_minutes(90)

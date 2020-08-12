@@ -9,7 +9,7 @@ use crate::flow::FlowLayout;
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragments::{
     AbsoluteOrFixedPositionedFragment, AnonymousFragment, BoxFragment, CollapsedBlockMargins,
-    DebugId, FontMetrics, Fragment, TextFragment,
+    DebugId, FontMetrics, Fragment, Tag, TextFragment,
 };
 use crate::geom::flow_relative::{Rect, Sides, Vec2};
 use crate::positioned::{
@@ -20,9 +20,10 @@ use crate::sizing::ContentSizes;
 use crate::style_ext::{ComputedValuesExt, Display, DisplayGeneratingBox, DisplayOutside};
 use crate::ContainingBlock;
 use app_units::Au;
+use atomic_refcell::AtomicRef;
 use gfx::text::text_run::GlyphRun;
 use servo_arc::Arc;
-use style::dom::OpaqueNode;
+use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style::values::computed::{Length, LengthPercentage, Percentage};
 use style::values::specified::text::TextAlignKeyword;
@@ -40,14 +41,14 @@ pub(crate) struct InlineFormattingContext {
 pub(crate) enum InlineLevelBox {
     InlineBox(InlineBox),
     TextRun(TextRun),
-    OutOfFlowAbsolutelyPositionedBox(Arc<AbsolutelyPositionedBox>),
+    OutOfFlowAbsolutelyPositionedBox(ArcRefCell<AbsolutelyPositionedBox>),
     OutOfFlowFloatBox(FloatBox),
     Atomic(IndependentFormattingContext),
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InlineBox {
-    pub tag: OpaqueNode,
+    pub tag: Tag,
     #[serde(skip_serializing)]
     pub style: Arc<ComputedValues>,
     pub first_fragment: bool,
@@ -58,7 +59,7 @@ pub(crate) struct InlineBox {
 /// https://www.w3.org/TR/css-display-3/#css-text-run
 #[derive(Debug, Serialize)]
 pub(crate) struct TextRun {
-    pub tag: OpaqueNode,
+    pub tag: Tag,
     #[serde(skip_serializing)]
     pub parent_style: Arc<ComputedValues>,
     pub text: String,
@@ -78,7 +79,7 @@ struct InlineNestingLevelState<'box_tree> {
 }
 
 struct PartialInlineBoxFragment<'box_tree> {
-    tag: OpaqueNode,
+    tag: Tag,
     style: Arc<ComputedValues>,
     start_corner: Vec2<Length>,
     padding: Sides<Length>,
@@ -139,24 +140,30 @@ impl InlineFormattingContext {
     // This works on an already-constructed `InlineFormattingContext`,
     // Which would have to change if/when
     // `BlockContainer::construct` parallelize their construction.
-    pub(super) fn inline_content_sizes(&self, layout_context: &LayoutContext) -> ContentSizes {
-        struct Computation {
+    pub(super) fn inline_content_sizes(
+        &self,
+        layout_context: &LayoutContext,
+        containing_block_writing_mode: WritingMode,
+    ) -> ContentSizes {
+        struct Computation<'a> {
+            layout_context: &'a LayoutContext<'a>,
+            containing_block_writing_mode: WritingMode,
             paragraph: ContentSizes,
             current_line: ContentSizes,
             current_line_percentages: Percentage,
         }
-        impl Computation {
-            fn traverse(
-                &mut self,
-                layout_context: &LayoutContext,
-                inline_level_boxes: &[ArcRefCell<InlineLevelBox>],
-            ) {
+        impl Computation<'_> {
+            fn traverse(&mut self, inline_level_boxes: &[ArcRefCell<InlineLevelBox>]) {
                 for inline_level_box in inline_level_boxes {
-                    match &*inline_level_box.borrow() {
+                    match &mut *inline_level_box.borrow_mut() {
                         InlineLevelBox::InlineBox(inline_box) => {
-                            let padding = inline_box.style.padding();
-                            let border = inline_box.style.border_width();
-                            let margin = inline_box.style.margin();
+                            let padding =
+                                inline_box.style.padding(self.containing_block_writing_mode);
+                            let border = inline_box
+                                .style
+                                .border_width(self.containing_block_writing_mode);
+                            let margin =
+                                inline_box.style.margin(self.containing_block_writing_mode);
                             macro_rules! add {
                                 ($condition: ident, $side: ident) => {
                                     if inline_box.$condition {
@@ -170,7 +177,7 @@ impl InlineFormattingContext {
                             }
 
                             add!(first_fragment, inline_start);
-                            self.traverse(layout_context, &inline_box.children);
+                            self.traverse(&inline_box.children);
                             add!(last_fragment, inline_end);
                         },
                         InlineLevelBox::TextRun(text_run) => {
@@ -178,7 +185,7 @@ impl InlineFormattingContext {
                                 runs,
                                 break_at_start,
                                 ..
-                            } = text_run.break_and_shape(layout_context);
+                            } = text_run.break_and_shape(self.layout_context);
                             if break_at_start {
                                 self.line_break_opportunity()
                             }
@@ -193,9 +200,10 @@ impl InlineFormattingContext {
                             }
                         },
                         InlineLevelBox::Atomic(atomic) => {
-                            let (outer, pc) = atomic
-                                .content_sizes
-                                .outer_inline_and_percentages(&atomic.style);
+                            let (outer, pc) = atomic.outer_inline_content_sizes_and_percentages(
+                                self.layout_context,
+                                self.containing_block_writing_mode,
+                            );
                             self.current_line.min_content += outer.min_content;
                             self.current_line.max_content += outer.max_content;
                             self.current_line_percentages += pc;
@@ -239,11 +247,13 @@ impl InlineFormattingContext {
             std::mem::replace(x, T::zero())
         }
         let mut computation = Computation {
+            layout_context,
+            containing_block_writing_mode,
             paragraph: ContentSizes::zero(),
             current_line: ContentSizes::zero(),
             current_line_percentages: Percentage::zero(),
         };
-        computation.traverse(layout_context, &self.inline_level_boxes);
+        computation.traverse(&self.inline_level_boxes);
         computation.forced_line_break();
         computation.paragraph
     }
@@ -276,7 +286,7 @@ impl InlineFormattingContext {
 
         loop {
             if let Some(child) = ifc.current_nesting_level.remaining_boxes.next() {
-                match &*child.borrow() {
+                match &mut *child.borrow_mut() {
                     InlineLevelBox::InlineBox(inline) => {
                         let partial = inline.start_layout(child.clone(), &mut ifc);
                         ifc.partial_inline_boxes_stack.push(partial)
@@ -284,8 +294,9 @@ impl InlineFormattingContext {
                     InlineLevelBox::TextRun(run) => run.layout(layout_context, &mut ifc),
                     InlineLevelBox::Atomic(a) => layout_atomic(layout_context, &mut ifc, a),
                     InlineLevelBox::OutOfFlowAbsolutelyPositionedBox(box_) => {
+                        let style = AtomicRef::map(box_.borrow(), |box_| box_.context.style());
                         let initial_start_corner =
-                            match Display::from(box_.contents.style.get_box().original_display) {
+                            match Display::from(style.get_box().original_display) {
                                 Display::GeneratingBox(DisplayGeneratingBox::OutsideInside {
                                     outside,
                                     inside: _,
@@ -307,6 +318,7 @@ impl InlineFormattingContext {
                             box_.clone(),
                             initial_start_corner,
                             tree_rank,
+                            ifc.containing_block,
                         );
                         let hoisted_fragment = hoisted_box.fragment.clone();
                         ifc.push_hoisted_box_to_positioning_context(hoisted_box);
@@ -314,7 +326,7 @@ impl InlineFormattingContext {
                             Fragment::AbsoluteOrFixedPositioned(
                                 AbsoluteOrFixedPositionedFragment {
                                     hoisted_fragment,
-                                    position: box_.contents.style.clone_position(),
+                                    position: style.clone_position(),
                                 },
                             ),
                         );
@@ -530,9 +542,10 @@ impl<'box_tree> PartialInlineBoxFragment<'box_tree> {
 fn layout_atomic(
     layout_context: &LayoutContext,
     ifc: &mut InlineFormattingContextState,
-    atomic: &IndependentFormattingContext,
+    atomic: &mut IndependentFormattingContext,
 ) {
-    let pbm = atomic.style.padding_border_margin(&ifc.containing_block);
+    let style = atomic.style();
+    let pbm = style.padding_border_margin(&ifc.containing_block);
     let margin = pbm.margin.auto_is(Length::zero);
     let pbm_sums = &(&pbm.padding + &pbm.border) + &margin;
     ifc.inline_position += pbm_sums.inline_start;
@@ -540,19 +553,24 @@ fn layout_atomic(
         block: pbm_sums.block_start,
         inline: ifc.inline_position - ifc.current_nesting_level.inline_start,
     };
-    if atomic.style.clone_position().is_relative() {
-        start_corner += &relative_adjustement(&atomic.style, ifc.containing_block)
+    if style.clone_position().is_relative() {
+        start_corner += &relative_adjustement(&style, ifc.containing_block)
     }
 
-    let fragment = match atomic.as_replaced() {
-        Ok(replaced) => {
-            let size =
-                replaced.used_size_as_if_inline_element(ifc.containing_block, &atomic.style, &pbm);
-            let fragments = replaced.make_fragments(&atomic.style, size.clone());
+    let fragment = match atomic {
+        IndependentFormattingContext::Replaced(replaced) => {
+            let size = replaced.contents.used_size_as_if_inline_element(
+                ifc.containing_block,
+                &replaced.style,
+                &pbm,
+            );
+            let fragments = replaced
+                .contents
+                .make_fragments(&replaced.style, size.clone());
             let content_rect = Rect { start_corner, size };
             BoxFragment::new(
-                atomic.tag,
-                atomic.style.clone(),
+                replaced.tag,
+                replaced.style.clone(),
                 fragments,
                 content_rect,
                 pbm.padding,
@@ -561,12 +579,14 @@ fn layout_atomic(
                 CollapsedBlockMargins::zero(),
             )
         },
-        Err(non_replaced) => {
-            let box_size = atomic.style.content_box_size(&ifc.containing_block, &pbm);
-            let max_box_size = atomic
+        IndependentFormattingContext::NonReplaced(non_replaced) => {
+            let box_size = non_replaced
+                .style
+                .content_box_size(&ifc.containing_block, &pbm);
+            let max_box_size = non_replaced
                 .style
                 .content_max_box_size(&ifc.containing_block, &pbm);
-            let min_box_size = atomic
+            let min_box_size = non_replaced
                 .style
                 .content_min_box_size(&ifc.containing_block, &pbm)
                 .auto_is(Length::zero);
@@ -574,7 +594,9 @@ fn layout_atomic(
             // https://drafts.csswg.org/css2/visudet.html#inlineblock-width
             let tentative_inline_size = box_size.inline.auto_is(|| {
                 let available_size = ifc.containing_block.inline_size - pbm_sums.inline_sum();
-                atomic.content_sizes.shrink_to_fit(available_size)
+                non_replaced
+                    .inline_content_sizes(layout_context)
+                    .shrink_to_fit(available_size)
             });
 
             // https://drafts.csswg.org/css2/visudet.html#min-max-widths
@@ -586,7 +608,7 @@ fn layout_atomic(
             let containing_block_for_children = ContainingBlock {
                 inline_size,
                 block_size: box_size.block,
-                style: &atomic.style,
+                style: &non_replaced.style,
             };
             assert_eq!(
                 ifc.containing_block.style.writing_mode,
@@ -622,8 +644,8 @@ fn layout_atomic(
                 },
             };
             BoxFragment::new(
-                atomic.tag,
-                atomic.style.clone(),
+                non_replaced.tag,
+                non_replaced.style.clone(),
                 independent_layout.fragments,
                 content_rect,
                 pbm.padding,
@@ -734,13 +756,21 @@ impl TextRun {
             let mut glyphs = vec![];
             let mut advance_width = Length::zero();
             let mut last_break_opportunity = None;
+            let mut force_line_break = false;
+            // Fit as many glyphs within a single line as possible.
             loop {
                 let next = runs.next();
+                // If there are no more text runs we still need to check if the last
+                // run was a forced line break
                 if next
                     .as_ref()
                     .map_or(true, |run| run.glyph_store.is_whitespace())
                 {
+                    // If this run exceeds the bounds of the containing block, then
+                    // we need to attempt to break the line.
                     if advance_width > ifc.containing_block.inline_size - ifc.inline_position {
+                        // Reset the text run iterator to the last whitespace if possible,
+                        // to attempt to re-layout the most recent glyphs on a new line.
                         if let Some((len, width, iter)) = last_break_opportunity.take() {
                             glyphs.truncate(len);
                             advance_width = width;
@@ -752,10 +782,24 @@ impl TextRun {
                 if let Some(run) = next {
                     if run.glyph_store.is_whitespace() {
                         last_break_opportunity = Some((glyphs.len(), advance_width, runs.clone()));
+                        // If this whitespace ends with a newline, we need to check if
+                        // it's meaningful within the current style. If so, we force
+                        // a line break immediately.
+                        let last_byte = self.text.as_bytes().get(run.range.end().to_usize() - 1);
+                        if last_byte == Some(&b'\n') &&
+                            self.parent_style
+                                .get_inherited_text()
+                                .white_space
+                                .preserve_newlines()
+                        {
+                            force_line_break = true;
+                            break;
+                        }
                     }
                     glyphs.push(run.glyph_store.clone());
                     advance_width += Length::from(run.glyph_store.total_advance());
                 } else {
+                    // No more runs, so we can end the line.
                     break;
                 }
             }
@@ -790,7 +834,8 @@ impl TextRun {
                     glyphs,
                     text_decoration_line: ifc.current_nesting_level.text_decoration_line,
                 }));
-            if runs.as_slice().is_empty() {
+            // If this line is being broken because of a trailing newline, we can't ignore it.
+            if runs.as_slice().is_empty() && !force_line_break {
                 break;
             } else {
                 // New line

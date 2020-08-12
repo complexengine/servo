@@ -5,11 +5,9 @@
 //! The context within which style is calculated.
 
 #[cfg(feature = "servo")]
-use crate::animation::ElementAnimationState;
+use crate::animation::DocumentAnimationSet;
 use crate::bloom::StyleBloom;
 use crate::data::{EagerPseudoStyles, ElementData};
-#[cfg(feature = "servo")]
-use crate::dom::OpaqueNode;
 use crate::dom::{SendElement, TElement};
 use crate::font_metrics::FontMetricsProvider;
 #[cfg(feature = "gecko")]
@@ -25,17 +23,15 @@ use crate::shared_lock::StylesheetGuards;
 use crate::sharing::StyleSharingCache;
 use crate::stylist::Stylist;
 use crate::thread_state::{self, ThreadState};
-use crate::timer::Timer;
 use crate::traversal::DomTraversal;
 use crate::traversal_flags::TraversalFlags;
 use app_units::Au;
 use euclid::default::Size2D;
 use euclid::Scale;
 use fxhash::FxHashMap;
-#[cfg(feature = "servo")]
-use parking_lot::RwLock;
 use selectors::matching::ElementSelectorFlags;
 use selectors::NthIndexCache;
+#[cfg(feature = "gecko")]
 use servo_arc::Arc;
 #[cfg(feature = "servo")]
 use servo_atoms::Atom;
@@ -156,9 +152,9 @@ pub struct SharedStyleContext<'a> {
     /// Guards for pre-acquired locks
     pub guards: StylesheetGuards<'a>,
 
-    /// The current timer for transitions and animations. This is needed to test
-    /// them.
-    pub timer: Timer,
+    /// The current time for transitions and animations. This is needed to ensure
+    /// a consistent sampling time and also to adjust the time for testing.
+    pub current_time_for_animations: f64,
 
     /// Flags controlling how we traverse the tree.
     pub traversal_flags: TraversalFlags,
@@ -168,7 +164,7 @@ pub struct SharedStyleContext<'a> {
 
     /// The state of all animations for our styled elements.
     #[cfg(feature = "servo")]
-    pub animation_states: Arc<RwLock<FxHashMap<OpaqueNode, ElementAnimationState>>>,
+    pub animations: DocumentAnimationSet,
 
     /// Paint worklets
     #[cfg(feature = "servo")]

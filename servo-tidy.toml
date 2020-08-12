@@ -18,9 +18,11 @@ rand = [
   "hashglobe", # Only used in tests
   "ipc-channel",
   "phf_generator",
+  "quickcheck", # Only used in tests
   "servo_rand",
   "tempfile",
   "uuid",
+  "tungstenite",
   "ws",
 ]
 
@@ -30,11 +32,21 @@ packages = [
   "arrayvec",
   "base64",
   "cocoa",
-  "dwrote",
   "gleam",
-  "peek-poke",
-  "peek-poke-derive",
+  "libloading",
+  "metal",
+  "miniz_oxide",
+  "num-rational",
+  "parking_lot",
+  "parking_lot_core",
   "wayland-sys",
+
+  # https://github.com/servo/servo/issues/26933
+  "futures",
+  "tokio-openssl",
+  "tokio",
+  "http",
+  "bytes",
 
   # https://github.com/servo/servo/pull/23288#issuecomment-494687746
   "gl_generator",
@@ -51,8 +63,14 @@ packages = [
   "core-foundation",
   "core-foundation-sys",
   "core-graphics",
-  "core-text",
   "lyon_geom",
+
+  # Duplicated by webrender debugger via ws
+  "digest",
+  "generic-array",
+  "opaque-debug",
+  "sha-1",
+  "block-buffer",
 ]
 # Files that are ignored for all tidy and lint checks.
 files = [
@@ -83,6 +101,7 @@ files = [
   # Python 3 syntax causes "E901 SyntaxError" when flake8 runs in Python 2
   "./etc/taskcluster/decision_task.py",
   "./etc/taskcluster/decisionlib.py",
+  "./tests/wpt/reftests-report/gen.py",
   "./components/style/properties/build.py",
 ]
 # Directories that are ignored for the non-WPT tidy check.

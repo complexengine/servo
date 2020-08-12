@@ -7,8 +7,7 @@ use immeta::load_from_buf;
 use ipc_channel::ipc::IpcSender;
 use net_traits::image::base::{load_from_memory, Image, ImageMetadata};
 use net_traits::image_cache::{
-    CanRequestImages, CorsStatus, ImageCache, ImageCacheResult, ImageResponder,
-    PendingImageResponse,
+    CorsStatus, ImageCache, ImageCacheResult, ImageResponder, PendingImageResponse,
 };
 use net_traits::image_cache::{ImageOrMetadataAvailable, ImageResponse};
 use net_traits::image_cache::{PendingImageId, UsePlaceholder};
@@ -87,9 +86,7 @@ fn set_webrender_image_key(webrender_api: &WebrenderIpcSender, image: &mut Image
     };
     let data = webrender_api::ImageData::new(bytes);
     let image_key = webrender_api.generate_image_key();
-    let mut txn = webrender_api::Transaction::new();
-    txn.add_image(image_key, descriptor, data, None);
-    webrender_api.update_resources(txn.resource_updates);
+    webrender_api.add_image(image_key, descriptor, data);
     image.id = Some(image_key);
 }
 
@@ -147,7 +144,6 @@ impl AllPendingLoads {
         url: ServoUrl,
         origin: ImmutableOrigin,
         cors_status: Option<CorsSettings>,
-        can_request: CanRequestImages,
     ) -> CacheResult<'a> {
         match self
             .url_to_load_key
@@ -158,10 +154,6 @@ impl AllPendingLoads {
                 CacheResult::Hit(*load_key, self.loads.get_mut(load_key).unwrap())
             },
             Vacant(url_entry) => {
-                if can_request == CanRequestImages::No {
-                    return CacheResult::Miss(None);
-                }
-
                 let load_key = self.keygen.next();
                 url_entry.insert(load_key);
 
@@ -461,7 +453,6 @@ impl ImageCache for ImageCacheImpl {
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
         use_placeholder: UsePlaceholder,
-        can_request: CanRequestImages,
     ) -> ImageCacheResult {
         let mut store = self.store.lock().unwrap();
         if let Some(result) = store.get_completed_image_if_available(
@@ -473,9 +464,12 @@ impl ImageCache for ImageCacheImpl {
             match result {
                 Ok((image, image_url)) => {
                     debug!("{} is available", url);
-                    return ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable(
-                        image, image_url,
-                    ));
+                    let is_placeholder = image_url == store.placeholder_url;
+                    return ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
+                        image,
+                        url: image_url,
+                        is_placeholder,
+                    });
                 },
                 Err(()) => {
                     debug!("{} is not available", url);
@@ -485,12 +479,9 @@ impl ImageCache for ImageCacheImpl {
         }
 
         let decoded = {
-            let result = store.pending_loads.get_cached(
-                url.clone(),
-                origin.clone(),
-                cors_setting,
-                can_request,
-            );
+            let result = store
+                .pending_loads
+                .get_cached(url.clone(), origin.clone(), cors_setting);
             match result {
                 CacheResult::Hit(key, pl) => match (&pl.result, &pl.metadata) {
                     (&Some(Ok(_)), _) => {
@@ -525,9 +516,14 @@ impl ImageCache for ImageCacheImpl {
         // TODO: make this behaviour configurable according to the caller's needs.
         store.handle_decoder(decoded);
         match store.get_completed_image_if_available(url, origin, cors_setting, use_placeholder) {
-            Some(Ok((image, image_url))) => ImageCacheResult::Available(
-                ImageOrMetadataAvailable::ImageAvailable(image, image_url),
-            ),
+            Some(Ok((image, image_url))) => {
+                let is_placeholder = image_url == store.placeholder_url;
+                ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
+                    image,
+                    url: image_url,
+                    is_placeholder,
+                })
+            },
             _ => ImageCacheResult::LoadError,
         }
     }
@@ -539,7 +535,6 @@ impl ImageCache for ImageCacheImpl {
         cors_setting: Option<CorsSettings>,
         sender: IpcSender<PendingImageResponse>,
         use_placeholder: UsePlaceholder,
-        can_request: CanRequestImages,
     ) -> ImageCacheResult {
         debug!("Track image for {} ({:?})", url, origin);
         let cache_result = self.get_cached_image_status(
@@ -547,7 +542,6 @@ impl ImageCache for ImageCacheImpl {
             origin.clone(),
             cors_setting,
             use_placeholder,
-            can_request,
         );
 
         match cache_result {
@@ -604,7 +598,7 @@ impl ImageCache for ImageCacheImpl {
                                 FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => {
                                     CorsStatus::Safe
                                 },
-                                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect => {
+                                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
                                     CorsStatus::Unsafe
                                 },
                             },

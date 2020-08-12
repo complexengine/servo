@@ -39,9 +39,11 @@ use devtools_traits::{PageError, ScriptToDevtoolsControlMsg, WorkerId};
 use embedder_traits::{EmbedderMsg, EmbedderProxy, PromptDefinition, PromptOrigin, PromptResult};
 use ipc_channel::ipc::{self, IpcSender};
 use msg::constellation_msg::{BrowsingContextId, PipelineId};
+use servo_rand::RngCore;
 use std::borrow::ToOwned;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -64,6 +66,7 @@ mod actors {
     pub mod profiler;
     pub mod root;
     pub mod stylesheets;
+    pub mod tab;
     pub mod thread;
     pub mod timeline;
     pub mod worker;
@@ -124,6 +127,9 @@ pub fn start_server(port: u16, embedder: EmbedderProxy) -> Sender<DevtoolsContro
     sender
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StreamId(u32);
+
 fn run_server(
     sender: Sender<DevtoolsControlMsg>,
     receiver: Receiver<DevtoolsControlMsg>,
@@ -137,8 +143,11 @@ fn run_server(
             .map(|port| (l, port))
     });
 
+    // A token shared with the embedder to bypass permission prompt.
+    let token = format!("{:X}", servo_rand::ServoRng::new().next_u32());
+
     let port = bound.as_ref().map(|(_, port)| *port).ok_or(());
-    embedder.send((None, EmbedderMsg::OnDevtoolsStarted(port)));
+    embedder.send((None, EmbedderMsg::OnDevtoolsStarted(port, token.clone())));
 
     let listener = match bound {
         Some((l, _)) => l,
@@ -182,22 +191,25 @@ fn run_server(
     let mut actor_workers: HashMap<WorkerId, String> = HashMap::new();
 
     /// Process the input from a single devtools client until EOF.
-    fn handle_client(actors: Arc<Mutex<ActorRegistry>>, mut stream: TcpStream) {
+    fn handle_client(actors: Arc<Mutex<ActorRegistry>>, mut stream: TcpStream, id: StreamId) {
         debug!("connection established to {}", stream.peer_addr().unwrap());
         {
             let actors = actors.lock().unwrap();
             let msg = actors.find::<RootActor>("root").encodable();
-            stream.write_json_packet(&msg);
+            if let Err(e) = stream.write_json_packet(&msg) {
+                warn!("Error writing response: {:?}", e);
+                return;
+            }
         }
 
         'outer: loop {
             match stream.read_json_packet() {
                 Ok(Some(json_packet)) => {
-                    if let Err(()) = actors
-                        .lock()
-                        .unwrap()
-                        .handle_message(json_packet.as_object().unwrap(), &mut stream)
-                    {
+                    if let Err(()) = actors.lock().unwrap().handle_message(
+                        json_packet.as_object().unwrap(),
+                        &mut stream,
+                        id,
+                    ) {
                         debug!("error: devtools actor stopped responding");
                         let _ = stream.shutdown(Shutdown::Both);
                         break 'outer;
@@ -213,6 +225,8 @@ fn run_server(
                 },
             }
         }
+
+        actors.lock().unwrap().cleanup(id);
     }
 
     fn handle_framerate_tick(actors: Arc<Mutex<ActorRegistry>>, actor_name: String, tick: f64) {
@@ -445,7 +459,7 @@ fn run_server(
                     eventActor: actor.event_actor(),
                 };
                 for stream in &mut connections {
-                    stream.write_json_packet(&msg);
+                    let _ = stream.write_json_packet(&msg);
                 }
             },
             NetworkEvent::HttpResponse(httpresponse) => {
@@ -458,7 +472,7 @@ fn run_server(
                     updateType: "requestHeaders".to_owned(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &actor.request_headers());
+                    let _ = stream.write_merged_json_packet(&msg, &actor.request_headers());
                 }
 
                 let msg = NetworkEventUpdateMsg {
@@ -467,7 +481,7 @@ fn run_server(
                     updateType: "requestCookies".to_owned(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &actor.request_cookies());
+                    let _ = stream.write_merged_json_packet(&msg, &actor.request_cookies());
                 }
 
                 //Send a networkEventUpdate (responseStart) to the client
@@ -479,7 +493,7 @@ fn run_server(
                 };
 
                 for stream in &mut connections {
-                    stream.write_json_packet(&msg);
+                    let _ = stream.write_json_packet(&msg);
                 }
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
@@ -490,7 +504,7 @@ fn run_server(
                     totalTime: actor.total_time(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &extra);
+                    let _ = stream.write_merged_json_packet(&msg, &extra);
                 }
 
                 let msg = NetworkEventUpdateMsg {
@@ -502,7 +516,7 @@ fn run_server(
                     state: "insecure".to_owned(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &extra);
+                    let _ = stream.write_merged_json_packet(&msg, &extra);
                 }
 
                 let msg = NetworkEventUpdateMsg {
@@ -511,7 +525,7 @@ fn run_server(
                     updateType: "responseContent".to_owned(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &actor.response_content());
+                    let _ = stream.write_merged_json_packet(&msg, &actor.response_content());
                 }
 
                 let msg = NetworkEventUpdateMsg {
@@ -520,7 +534,7 @@ fn run_server(
                     updateType: "responseCookies".to_owned(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &actor.response_cookies());
+                    let _ = stream.write_merged_json_packet(&msg, &actor.response_cookies());
                 }
 
                 let msg = NetworkEventUpdateMsg {
@@ -529,7 +543,7 @@ fn run_server(
                     updateType: "responseHeaders".to_owned(),
                 };
                 for stream in &mut connections {
-                    stream.write_merged_json_packet(&msg, &actor.response_headers());
+                    let _ = stream.write_merged_json_packet(&msg, &actor.response_headers());
                 }
             },
         }
@@ -563,35 +577,32 @@ fn run_server(
         .spawn(move || {
             // accept connections and process them, spawning a new thread for each one
             for stream in listener.incoming() {
-                // Prompt user for permission
-                let (embedder_sender, receiver) =
-                    ipc::channel().expect("Failed to create IPC channel!");
-                let message = "Accept incoming devtools connection?".to_owned();
-                let prompt = PromptDefinition::YesNo(message, embedder_sender);
-                let msg = EmbedderMsg::Prompt(prompt, PromptOrigin::Trusted);
-                embedder.send((None, msg));
-                if receiver.recv().unwrap() != PromptResult::Primary {
+                let mut stream = stream.expect("Can't retrieve stream");
+                if !allow_devtools_client(&mut stream, &embedder, &token) {
                     continue;
-                }
+                };
                 // connection succeeded and accepted
                 sender
                     .send(DevtoolsControlMsg::FromChrome(
-                        ChromeToDevtoolsControlMsg::AddClient(stream.unwrap()),
+                        ChromeToDevtoolsControlMsg::AddClient(stream),
                     ))
                     .unwrap();
             }
         })
         .expect("Thread spawning failed");
 
+    let mut next_id = StreamId(0);
     while let Ok(msg) = receiver.recv() {
         debug!("{:?}", msg);
         match msg {
             DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::AddClient(stream)) => {
                 let actors = actors.clone();
+                let id = next_id;
+                next_id = StreamId(id.0 + 1);
                 accepted_connections.push(stream.try_clone().unwrap());
                 thread::Builder::new()
                     .name("DevtoolsClientHandler".to_owned())
-                    .spawn(move || handle_client(actors, stream.try_clone().unwrap()))
+                    .spawn(move || handle_client(actors, stream.try_clone().unwrap(), id))
                     .expect("Thread spawning failed");
             },
             DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::FramerateTick(
@@ -703,4 +714,34 @@ fn run_server(
     for connection in &mut accepted_connections {
         let _ = connection.shutdown(Shutdown::Both);
     }
+}
+
+fn allow_devtools_client(stream: &mut TcpStream, embedder: &EmbedderProxy, token: &str) -> bool {
+    // By-pass prompt if we receive a valid token.
+    let token = format!("25:{{\"auth_token\":\"{}\"}}", token);
+    let mut buf = [0; 28];
+    let timeout = std::time::Duration::from_millis(500);
+    // This will read but not consume the bytes from the stream.
+    stream.set_read_timeout(Some(timeout)).unwrap();
+    let peek = stream.peek(&mut buf);
+    stream.set_read_timeout(None).unwrap();
+    if let Ok(len) = peek {
+        if len == buf.len() {
+            if let Ok(s) = std::str::from_utf8(&buf) {
+                if s == token {
+                    // Consume the message as it was relevant to us.
+                    let _ = stream.read_exact(&mut buf);
+                    return true;
+                }
+            }
+        }
+    };
+
+    // No token found. Prompt user
+    let (embedder_sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
+    let message = "Accept incoming devtools connection?".to_owned();
+    let prompt = PromptDefinition::YesNo(message, embedder_sender);
+    let msg = EmbedderMsg::Prompt(prompt, PromptOrigin::Trusted);
+    embedder.send((None, msg));
+    receiver.recv().unwrap() == PromptResult::Primary
 }

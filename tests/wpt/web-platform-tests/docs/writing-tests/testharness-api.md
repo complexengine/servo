@@ -332,8 +332,8 @@ async_test((t) => {
 
 A failing `assert_implements_optional` call is reported as a status of
 `PRECONDITION_FAILED` for the subtest. This unusual status code is a legacy
-leftover from the deprecated `assert_precondition`; see the [RFC that renamed
-it](https://github.com/web-platform-tests/rfcs/pull/48).
+leftover; see the [RFC that introduced
+`assert_implements_optional`](https://github.com/web-platform-tests/rfcs/pull/48).
 
 `assert_implements_optional` can also be used during test setup. For example:
 
@@ -392,8 +392,47 @@ timeout to use.
 
 In other cases it may be necessary to use a timeout (e.g., for a test
 that only passes if some event is *not* fired). In this case it is
-*not* permitted to use the standard `setTimeout` function. Instead one
-must use the `step_timeout` function:
+*not* permitted to use the standard `setTimeout` function.
+
+Instead, one of these functions can be used:
+
+* `step_wait` (returns a promise)
+* `step_wait_func` & `step_wait_func_done`
+* As a last resort, `step_timeout`
+
+### `step_wait`, `step_wait_func`, and `step_wait_func_done` ###
+
+These functions are preferred over `step_timeout` as they end when a condition or a timeout is reached, rather than just a timeout. This allows for setting a longer timeout while shortening the runtime of tests on faster machines.
+
+`step_wait(cond, description, timeout=3000, interval=100)` is useful inside `promise_test`, e.g.:
+
+```js
+promise_test(t => {
+  // …
+  await t.step_wait(() => frame.contentDocument === null, "Frame navigated to a cross-origin document");
+  // …
+}, "");
+```
+
+`step_wait_func(cond, func, description, timeout=3000, interval=100)` & `step_wait_func(cond, func, description, timeout=3000, interval=100)` are useful inside `async_test`:
+
+```js
+async_test(t => {
+  const popup = window.open("resources/coop-coep.py?coop=same-origin&coep=&navigate=about:blank");
+  t.add_cleanup(() => popup.close());
+  assert_equals(window, popup.opener);
+
+  popup.onload = t.step_func(() => {
+    assert_true(popup.location.href.endsWith("&navigate=about:blank"));
+    // Use step_wait_func_done as about:blank cannot message back.
+    t.step_wait_func_done(() => popup.location.href === "about:blank");
+  });
+}, "Navigating a popup to about:blank");
+```
+
+### `step_timeout` ###
+
+As a last resort one can use the `step_timeout` function:
 
 ```js
 async_test(function(t) {
@@ -476,7 +515,7 @@ properties of the test harness (enumerated in the following section).
 Both setup functions recognize the following properties:
 
 `explicit_done` - Wait for an explicit call to done() before declaring all
-tests complete (see below; implicitly true for single page tests)
+tests complete (see below; always true for single page tests)
 
 `output_document` - The document to which results should be logged. By default
 this is the current document but could be an ancestor document in some cases
@@ -488,6 +527,10 @@ with some existing test framework that has its own timeout mechanism).
 
 `allow_uncaught_exception` - don't treat an uncaught exception as an error;
 needed when e.g. testing the `window.onerror` handler.
+
+`hide_test_state` - hide the test state output while the test is
+running; This is helpful when the output of the test state may interfere
+the test results.
 
 `timeout_multiplier` - Multiplier to apply to per-test timeouts.
 
@@ -903,9 +946,6 @@ asserts that one `assert_func(actual, expected_array_N, extra_arg1, ..., extra_a
   with multiple allowed pass conditions are bad practice unless the spec specifically
   allows multiple behaviours. Test authors should not use this method simply to hide
   UA bugs.
-
-### **DEPRECATED** `assert_precondition(condition, description)`
-Use `assert_implements` or `assert_implements_optional` instead.
 
 ## Utility functions ##
 

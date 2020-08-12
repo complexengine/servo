@@ -9,19 +9,19 @@ interface GPUBindGroupLayout {
 GPUBindGroupLayout includes GPUObjectBase;
 
 dictionary GPUBindGroupLayoutDescriptor : GPUObjectDescriptorBase {
-    required sequence<GPUBindGroupLayoutBindings> bindings;
+    required sequence<GPUBindGroupLayoutEntry> entries;
 };
 
-// Note: Servo codegen doesn't like the name `GPUBindGroupLayoutBinding` because it's already occupied
-// dictionary GPUBindGroupLayoutBinding {
-dictionary GPUBindGroupLayoutBindings {
-    required unsigned long binding;
+dictionary GPUBindGroupLayoutEntry {
+    required GPUIndex32 binding;
     required GPUShaderStageFlags visibility;
     required GPUBindingType type;
-    //GPUTextureViewDimension textureDimension = "2d";
-    //GPUTextureComponentType textureComponentType = "float";
-    boolean multisampled = false;
     boolean hasDynamicOffset = false;
+    GPUSize64 minBufferBindingSize = 0;
+    GPUTextureViewDimension viewDimension;
+    GPUTextureComponentType textureComponentType;
+    boolean multisampled = false;
+    GPUTextureFormat storageTextureFormat;
 };
 
 enum GPUBindingType {
@@ -29,6 +29,8 @@ enum GPUBindingType {
     "storage-buffer",
     "readonly-storage-buffer",
     "sampler",
+    "comparison-sampler",
     "sampled-texture",
-    "storage-texture"
+    "readonly-storage-texture",
+    "writeonly-storage-texture"
 };

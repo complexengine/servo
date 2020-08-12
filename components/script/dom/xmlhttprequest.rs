@@ -2,14 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::body::{BodySource, Extractable, ExtractedBody};
 use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
-use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::BodyInit;
 use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::XMLHttpRequestMethods;
 use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::XMLHttpRequestResponseType;
-use crate::dom::bindings::codegen::UnionTypes::DocumentOrBodyInit;
+use crate::dom::bindings::codegen::UnionTypes::DocumentOrXMLHttpRequestBodyInit;
 use crate::dom::bindings::conversions::ToJSValConvertible;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -22,15 +21,13 @@ use crate::dom::document::DocumentSource;
 use crate::dom::document::{Document, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::formdata::FormData;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::is_forbidden_header_name;
-use crate::dom::htmlformelement::{encode_multipart_form_data, generate_boundary};
 use crate::dom::node::Node;
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::progressevent::ProgressEvent;
+use crate::dom::readablestream::ReadableStream;
 use crate::dom::servoparser::ServoParser;
-use crate::dom::urlsearchparams::URLSearchParams;
 use crate::dom::window::Window;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::xmlhttprequesteventtarget::XMLHttpRequestEventTarget;
@@ -163,7 +160,7 @@ pub struct XMLHttpRequest {
     fetch_time: Cell<i64>,
     generation_id: Cell<GenerationId>,
     response_status: Cell<Result<(), ()>>,
-    referrer_url: Option<ServoUrl>,
+    referrer: Referrer,
     referrer_policy: Option<ReferrerPolicy>,
     canceller: DomRefCell<FetchCanceller>,
 }
@@ -171,11 +168,11 @@ pub struct XMLHttpRequest {
 impl XMLHttpRequest {
     fn new_inherited(global: &GlobalScope) -> XMLHttpRequest {
         //TODO - update this when referrer policy implemented for workers
-        let (referrer_url, referrer_policy) = if let Some(window) = global.downcast::<Window>() {
+        let referrer_policy = if let Some(window) = global.downcast::<Window>() {
             let document = window.Document();
-            (Some(document.url()), document.get_referrer_policy())
+            document.get_referrer_policy()
         } else {
-            (None, None)
+            None
         };
 
         XMLHttpRequest {
@@ -209,7 +206,7 @@ impl XMLHttpRequest {
             fetch_time: Cell::new(0),
             generation_id: Cell::new(GenerationId(0)),
             response_status: Cell::new(Ok(())),
-            referrer_url: referrer_url,
+            referrer: global.get_referrer(),
             referrer_policy: referrer_policy,
             canceller: DomRefCell::new(Default::default()),
         }
@@ -343,7 +340,7 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
         &self,
         method: ByteString,
         url: USVString,
-        r#async: bool,
+        asynch: bool,
         username: Option<USVString>,
         password: Option<USVString>,
     ) -> ErrorResult {
@@ -399,7 +396,7 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
                 }
 
                 // Step 10
-                if !r#async {
+                if !asynch {
                     // FIXME: This should only happen if the global environment is a document environment
                     if self.timeout.get() != 0 ||
                         self.response_type.get() != XMLHttpRequestResponseType::_empty
@@ -419,7 +416,7 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
                 // Step 12
                 *self.request_method.borrow_mut() = parsed_method;
                 *self.request_url.borrow_mut() = Some(parsed_url);
-                self.sync.set(!r#async);
+                self.sync.set(!asynch);
                 *self.request_headers.borrow_mut() = HeaderMap::new();
                 self.send_flag.set(false);
                 *self.status_text.borrow_mut() = ByteString::new(vec![]);
@@ -550,7 +547,7 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
     }
 
     // https://xhr.spec.whatwg.org/#the-send()-method
-    fn Send(&self, data: Option<DocumentOrBodyInit>) -> ErrorResult {
+    fn Send(&self, data: Option<DocumentOrXMLHttpRequestBodyInit>) -> ErrorResult {
         // Step 1, 2
         if self.ready_state.get() != XMLHttpRequestState::Opened || self.send_flag.get() {
             return Err(Error::InvalidState);
@@ -562,42 +559,85 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
             _ => data,
         };
         // Step 4 (first half)
-        let extracted_or_serialized = match data {
-            Some(DocumentOrBodyInit::Document(ref doc)) => {
-                let data = Vec::from(serialize_document(&doc)?.as_ref());
+        let mut extracted_or_serialized = match data {
+            Some(DocumentOrXMLHttpRequestBodyInit::Document(ref doc)) => {
+                let bytes = Vec::from(serialize_document(&doc)?.as_ref());
                 let content_type = if doc.is_html_document() {
                     "text/html;charset=UTF-8"
                 } else {
                     "application/xml;charset=UTF-8"
                 };
-                Some((data, Some(DOMString::from(content_type))))
+                let total_bytes = bytes.len();
+                let global = self.global();
+                let stream = ReadableStream::new_from_bytes(&global, bytes);
+                Some(ExtractedBody {
+                    stream,
+                    total_bytes: Some(total_bytes),
+                    content_type: Some(DOMString::from(content_type)),
+                    source: BodySource::Object,
+                })
             },
-            Some(DocumentOrBodyInit::Blob(ref b)) => Some(b.extract()),
-            Some(DocumentOrBodyInit::FormData(ref formdata)) => Some(formdata.extract()),
-            Some(DocumentOrBodyInit::String(ref str)) => Some(str.extract()),
-            Some(DocumentOrBodyInit::URLSearchParams(ref urlsp)) => Some(urlsp.extract()),
-            Some(DocumentOrBodyInit::ArrayBuffer(ref typedarray)) => {
-                Some((typedarray.to_vec(), None))
+            Some(DocumentOrXMLHttpRequestBodyInit::Blob(ref b)) => {
+                let extracted_body = b.extract(&self.global()).expect("Couldn't extract body.");
+                if !extracted_body.in_memory() && self.sync.get() {
+                    warn!("Sync XHR with not in-memory Blob as body not supported");
+                    None
+                } else {
+                    Some(extracted_body)
+                }
             },
-            Some(DocumentOrBodyInit::ArrayBufferView(ref typedarray)) => {
-                Some((typedarray.to_vec(), None))
+            Some(DocumentOrXMLHttpRequestBodyInit::FormData(ref formdata)) => Some(
+                formdata
+                    .extract(&self.global())
+                    .expect("Couldn't extract body."),
+            ),
+            Some(DocumentOrXMLHttpRequestBodyInit::String(ref str)) => {
+                Some(str.extract(&self.global()).expect("Couldn't extract body."))
+            },
+            Some(DocumentOrXMLHttpRequestBodyInit::URLSearchParams(ref urlsp)) => Some(
+                urlsp
+                    .extract(&self.global())
+                    .expect("Couldn't extract body."),
+            ),
+            Some(DocumentOrXMLHttpRequestBodyInit::ArrayBuffer(ref typedarray)) => {
+                let bytes = typedarray.to_vec();
+                let total_bytes = bytes.len();
+                let global = self.global();
+                let stream = ReadableStream::new_from_bytes(&global, bytes);
+                Some(ExtractedBody {
+                    stream,
+                    total_bytes: Some(total_bytes),
+                    content_type: None,
+                    source: BodySource::Object,
+                })
+            },
+            Some(DocumentOrXMLHttpRequestBodyInit::ArrayBufferView(ref typedarray)) => {
+                let bytes = typedarray.to_vec();
+                let total_bytes = bytes.len();
+                let global = self.global();
+                let stream = ReadableStream::new_from_bytes(&global, bytes);
+                Some(ExtractedBody {
+                    stream,
+                    total_bytes: Some(total_bytes),
+                    content_type: None,
+                    source: BodySource::Object,
+                })
             },
             None => None,
         };
 
-        self.request_body_len
-            .set(extracted_or_serialized.as_ref().map_or(0, |e| e.0.len()));
+        self.request_body_len.set(
+            extracted_or_serialized
+                .as_ref()
+                .map_or(0, |e| e.total_bytes.unwrap_or(0)),
+        );
 
         // todo preserved headers?
 
         // Step 6
         self.upload_complete.set(false);
         // Step 7
-        self.upload_complete.set(match extracted_or_serialized {
-            None => true,
-            Some(ref e) if e.0.is_empty() => true,
-            _ => false,
-        });
+        self.upload_complete.set(extracted_or_serialized.is_none());
         // Step 8
         self.send_flag.set(true);
 
@@ -634,34 +674,38 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
             unreachable!()
         };
 
-        let mut request = RequestBuilder::new(self.request_url.borrow().clone().unwrap())
-            .method(self.request_method.borrow().clone())
-            .headers((*self.request_headers.borrow()).clone())
-            .unsafe_request(true)
-            // XXXManishearth figure out how to avoid this clone
-            .body(extracted_or_serialized.as_ref().map(|e| e.0.clone()))
-            // XXXManishearth actually "subresource", but it doesn't exist
-            // https://github.com/whatwg/xhr/issues/71
-            .destination(Destination::None)
-            .synchronous(self.sync.get())
-            .mode(RequestMode::CorsMode)
-            .use_cors_preflight(has_handlers)
-            .credentials_mode(credentials_mode)
-            .use_url_credentials(use_url_credentials)
-            .origin(self.global().origin().immutable().clone())
-            .referrer(
-                self.referrer_url
-                    .clone()
-                    .map(|referrer_url| Referrer::ReferrerUrl(referrer_url)),
-            )
-            .referrer_policy(self.referrer_policy.clone())
-            .pipeline_id(Some(self.global().pipeline_id()));
+        let content_type = match extracted_or_serialized.as_mut() {
+            Some(body) => body.content_type.take(),
+            None => None,
+        };
+
+        let mut request = RequestBuilder::new(
+            self.request_url.borrow().clone().unwrap(),
+            self.referrer.clone(),
+        )
+        .method(self.request_method.borrow().clone())
+        .headers((*self.request_headers.borrow()).clone())
+        .unsafe_request(true)
+        // XXXManishearth figure out how to avoid this clone
+        .body(extracted_or_serialized.map(|e| e.into_net_request_body().0))
+        // XXXManishearth actually "subresource", but it doesn't exist
+        // https://github.com/whatwg/xhr/issues/71
+        .destination(Destination::None)
+        .synchronous(self.sync.get())
+        .mode(RequestMode::CorsMode)
+        .use_cors_preflight(has_handlers)
+        .credentials_mode(credentials_mode)
+        .use_url_credentials(use_url_credentials)
+        .origin(self.global().origin().immutable().clone())
+        .referrer_policy(self.referrer_policy.clone())
+        .pipeline_id(Some(self.global().pipeline_id()));
 
         // step 4 (second half)
-        match extracted_or_serialized {
-            Some((_, ref content_type)) => {
+        match content_type {
+            Some(content_type) => {
                 let encoding = match data {
-                    Some(DocumentOrBodyInit::String(_)) | Some(DocumentOrBodyInit::Document(_)) =>
+                    Some(DocumentOrXMLHttpRequestBodyInit::String(_)) |
+                    Some(DocumentOrXMLHttpRequestBodyInit::Document(_)) =>
                     // XHR spec differs from http, and says UTF-8 should be in capitals,
                     // instead of "utf-8", which is what Hyper defaults to. So not
                     // using content types provided by Hyper.
@@ -672,13 +716,12 @@ impl XMLHttpRequestMethods for XMLHttpRequest {
                 };
 
                 let mut content_type_set = false;
-                if let Some(ref ct) = *content_type {
-                    if !request.headers.contains_key(header::CONTENT_TYPE) {
-                        request
-                            .headers
-                            .insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
-                        content_type_set = true;
-                    }
+                if !request.headers.contains_key(header::CONTENT_TYPE) {
+                    request.headers.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_str(&content_type).unwrap(),
+                    );
+                    content_type_set = true;
                 }
 
                 if !content_type_set {
@@ -984,7 +1027,7 @@ impl XMLHttpRequest {
                     FilteredMetadata::Basic(m) => m,
                     FilteredMetadata::Cors(m) => m,
                     FilteredMetadata::Opaque => return Err(Error::Network),
-                    FilteredMetadata::OpaqueRedirect => return Err(Error::Network),
+                    FilteredMetadata::OpaqueRedirect(_) => return Err(Error::Network),
                 },
             },
             Err(_) => {
@@ -1501,7 +1544,10 @@ impl XMLHttpRequest {
 
         if let Some(script_port) = script_port {
             loop {
-                global.process_event(script_port.recv().unwrap());
+                if !global.process_event(script_port.recv().unwrap()) {
+                    // We're exiting.
+                    return Err(Error::Abort);
+                }
                 let context = context.lock().unwrap();
                 let sync_status = context.sync_status.borrow();
                 if let Some(ref status) = *sync_status {
@@ -1555,75 +1601,11 @@ impl XHRTimeoutCallback {
     }
 }
 
-pub trait Extractable {
-    fn extract(&self) -> (Vec<u8>, Option<DOMString>);
-}
-
-impl Extractable for Blob {
-    fn extract(&self) -> (Vec<u8>, Option<DOMString>) {
-        let content_type = if self.Type().as_ref().is_empty() {
-            None
-        } else {
-            Some(self.Type())
-        };
-        let bytes = self.get_bytes().unwrap_or(vec![]);
-        (bytes, content_type)
-    }
-}
-
-impl Extractable for DOMString {
-    fn extract(&self) -> (Vec<u8>, Option<DOMString>) {
-        (
-            self.as_bytes().to_owned(),
-            Some(DOMString::from("text/plain;charset=UTF-8")),
-        )
-    }
-}
-
-impl Extractable for FormData {
-    fn extract(&self) -> (Vec<u8>, Option<DOMString>) {
-        let boundary = generate_boundary();
-        let bytes = encode_multipart_form_data(&mut self.datums(), boundary.clone(), UTF_8);
-        (
-            bytes,
-            Some(DOMString::from(format!(
-                "multipart/form-data;boundary={}",
-                boundary
-            ))),
-        )
-    }
-}
-
-impl Extractable for URLSearchParams {
-    fn extract(&self) -> (Vec<u8>, Option<DOMString>) {
-        (
-            self.serialize_utf8().into_bytes(),
-            Some(DOMString::from(
-                "application/x-www-form-urlencoded;charset=UTF-8",
-            )),
-        )
-    }
-}
-
 fn serialize_document(doc: &Document) -> Fallible<DOMString> {
     let mut writer = vec![];
     match serialize(&mut writer, &doc.upcast::<Node>(), SerializeOpts::default()) {
         Ok(_) => Ok(DOMString::from(String::from_utf8(writer).unwrap())),
         Err(_) => Err(Error::InvalidState),
-    }
-}
-
-impl Extractable for BodyInit {
-    // https://fetch.spec.whatwg.org/#concept-bodyinit-extract
-    fn extract(&self) -> (Vec<u8>, Option<DOMString>) {
-        match *self {
-            BodyInit::String(ref s) => s.extract(),
-            BodyInit::URLSearchParams(ref usp) => usp.extract(),
-            BodyInit::Blob(ref b) => b.extract(),
-            BodyInit::FormData(ref formdata) => formdata.extract(),
-            BodyInit::ArrayBuffer(ref typedarray) => ((typedarray.to_vec(), None)),
-            BodyInit::ArrayBufferView(ref typedarray) => ((typedarray.to_vec(), None)),
-        }
     }
 }
 

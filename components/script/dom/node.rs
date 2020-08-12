@@ -150,12 +150,9 @@ pub struct Node {
     /// are this node.
     ranges: WeakRangeVec,
 
-    /// Style+Layout information. Only the layout thread may touch this data.
-    ///
-    /// Must be sent back to the layout thread to be destroyed when this
-    /// node is finalized.
-    #[ignore_malloc_size_of = "Unsafe cell"]
-    style_and_layout_data: UnsafeCell<Option<Box<StyleAndOpaqueLayoutData>>>,
+    /// Style+Layout information.
+    #[ignore_malloc_size_of = "trait object"]
+    style_and_layout_data: DomRefCell<Option<Box<StyleAndOpaqueLayoutData>>>,
 }
 
 bitflags! {
@@ -196,6 +193,10 @@ bitflags! {
 
         /// Specifies whether this node's shadow-including root is a document.
         const IS_CONNECTED = 1 << 10;
+
+        /// Whether this node has a weird parser insertion mode. i.e whether setting innerHTML
+        /// needs extra work or not
+        const HAS_WEIRD_PARSER_INSERTION_MODE = 1 << 11;
     }
 }
 
@@ -280,6 +281,11 @@ impl Node {
         }
     }
 
+    pub fn clean_up_layout_data(&self) {
+        self.owner_doc().cancel_animations_for_node(self);
+        self.style_and_layout_data.borrow_mut().take();
+    }
+
     /// Clean up flags and unbind from tree.
     pub fn complete_remove_subtree(root: &Node, context: &UnbindContext) {
         for node in root.traverse_preorder(ShadowIncluding::Yes) {
@@ -294,6 +300,8 @@ impl Node {
             );
         }
         for node in root.traverse_preorder(ShadowIncluding::Yes) {
+            node.clean_up_layout_data();
+
             // This needs to be in its own loop, because unbind_from_tree may
             // rely on the state of IS_IN_DOC of the context node's descendants,
             // e.g. when removing a <form>.
@@ -314,6 +322,8 @@ impl Node {
     /// Fails unless `child` is a child of this node.
     fn remove_child(&self, child: &Node, cached_index: Option<u32>) {
         assert!(child.parent_node.get().as_deref() == Some(self));
+        self.note_dirty_descendants();
+
         let prev_sibling = child.GetPreviousSibling();
         match prev_sibling {
             None => {
@@ -554,6 +564,16 @@ impl Node {
         self.flags.get().contains(NodeFlags::IS_IN_SHADOW_TREE)
     }
 
+    pub fn has_weird_parser_insertion_mode(&self) -> bool {
+        self.flags
+            .get()
+            .contains(NodeFlags::HAS_WEIRD_PARSER_INSERTION_MODE)
+    }
+
+    pub fn set_weird_parser_insertion_mode(&self) {
+        self.set_flag(NodeFlags::HAS_WEIRD_PARSER_INSERTION_MODE, true)
+    }
+
     pub fn is_connected(&self) -> bool {
         self.flags.get().contains(NodeFlags::IS_CONNECTED)
     }
@@ -616,17 +636,7 @@ impl Node {
 
     // FIXME(emilio): This and the function below should move to Element.
     pub fn note_dirty_descendants(&self) {
-        debug_assert!(self.is_connected());
-
-        for ancestor in self.inclusive_ancestors(ShadowIncluding::Yes) {
-            if ancestor.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS) {
-                return;
-            }
-
-            if ancestor.is::<Element>() {
-                ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
-            }
-        }
+        self.owner_doc().note_node_with_dirty_descendants(self);
     }
 
     pub fn has_dirty_descendants(&self) -> bool {
@@ -692,6 +702,22 @@ impl Node {
             current: Some(DomRoot::from_ref(self)),
             next_node: |n| n.GetPreviousSibling(),
         }
+    }
+
+    pub fn common_ancestor(
+        &self,
+        other: &Node,
+        shadow_including: ShadowIncluding,
+    ) -> Option<DomRoot<Node>> {
+        for ancestor in self.inclusive_ancestors(shadow_including) {
+            if other
+                .inclusive_ancestors(shadow_including)
+                .any(|node| node == ancestor)
+            {
+                return Some(ancestor);
+            }
+        }
+        None
     }
 
     pub fn is_inclusive_ancestor_of(&self, parent: &Node) -> bool {
@@ -1232,21 +1258,38 @@ impl Node {
         }
     }
 
-    #[allow(unsafe_code)]
-    pub fn style(&self) -> Option<Arc<ComputedValues>> {
-        if !window_from_node(self).layout_reflow(QueryMsg::StyleQuery) {
-            return None;
-        }
-        unsafe {
-            (*self.style_and_layout_data.get()).as_ref().map(|data| {
+    pub fn is_styled(&self) -> bool {
+        self.style_and_layout_data.borrow().is_some()
+    }
+
+    pub fn is_display_none(&self) -> bool {
+        self.style_and_layout_data
+            .borrow()
+            .as_ref()
+            .map_or(true, |data| {
                 data.style_data
                     .element_data
                     .borrow()
                     .styles
                     .primary()
-                    .clone()
+                    .get_box()
+                    .display
+                    .is_none()
             })
+    }
+
+    pub fn style(&self) -> Option<Arc<ComputedValues>> {
+        if !window_from_node(self).layout_reflow(QueryMsg::StyleQuery) {
+            return None;
         }
+        self.style_and_layout_data.borrow().as_ref().map(|data| {
+            data.style_data
+                .element_data
+                .borrow()
+                .styles
+                .primary()
+                .clone()
+        })
     }
 }
 
@@ -1430,13 +1473,21 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     #[inline]
     #[allow(unsafe_code)]
     fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData> {
-        unsafe { (*self.unsafe_get().style_and_layout_data.get()).as_deref() }
+        unsafe {
+            self.unsafe_get()
+                .style_and_layout_data
+                .borrow_for_layout()
+                .as_deref()
+        }
     }
 
     #[inline]
     #[allow(unsafe_code)]
     unsafe fn init_style_and_opaque_layout_data(self, val: Box<StyleAndOpaqueLayoutData>) {
-        let data = &mut *self.unsafe_get().style_and_layout_data.get();
+        let data = self
+            .unsafe_get()
+            .style_and_layout_data
+            .borrow_mut_for_layout();
         debug_assert!(data.is_none());
         *data = Some(val);
     }
@@ -1444,7 +1495,9 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     #[inline]
     #[allow(unsafe_code)]
     unsafe fn take_style_and_opaque_layout_data(self) -> Box<StyleAndOpaqueLayoutData> {
-        (*self.unsafe_get().style_and_layout_data.get())
+        self.unsafe_get()
+            .style_and_layout_data
+            .borrow_mut_for_layout()
             .take()
             .unwrap()
     }
@@ -1635,7 +1688,7 @@ where
 }
 
 /// Whether a tree traversal should pass shadow tree boundaries.
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum ShadowIncluding {
     No,
     Yes,
@@ -1761,7 +1814,7 @@ impl Node {
             inclusive_descendants_version: Cell::new(0),
             ranges: WeakRangeVec::new(),
 
-            style_and_layout_data: UnsafeCell::new(None),
+            style_and_layout_data: Default::default(),
         }
     }
 
@@ -3425,11 +3478,17 @@ impl Into<LayoutElementType> for ElementTypeId {
     #[inline(always)]
     fn into(self) -> LayoutElementType {
         match self {
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement) => {
+                LayoutElementType::HTMLBodyElement
+            },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBRElement) => {
                 LayoutElementType::HTMLBRElement
             },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLCanvasElement) => {
                 LayoutElementType::HTMLCanvasElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLHtmlElement) => {
+                LayoutElementType::HTMLHtmlElement
             },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLIFrameElement) => {
                 LayoutElementType::HTMLIFrameElement

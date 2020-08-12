@@ -64,7 +64,7 @@ use crate::properties::{ComputedValues, LonghandId};
 use crate::properties::{Importance, PropertyDeclaration, PropertyDeclarationBlock};
 use crate::rule_tree::CascadeLevel as ServoCascadeLevel;
 use crate::selector_parser::{AttrValue, HorizontalDirection, Lang};
-use crate::shared_lock::Locked;
+use crate::shared_lock::{Locked, SharedRwLock};
 use crate::string_cache::{Atom, Namespace, WeakAtom, WeakNamespace};
 use crate::stylist::CascadeData;
 use crate::values::computed::font::GenericFontFamily;
@@ -138,6 +138,10 @@ impl<'ld> TDocument for GeckoDocument<'ld> {
         Ok(elements_with_id(unsafe {
             bindings::Gecko_Document_GetElementsWithId(self.0, id.as_ptr())
         }))
+    }
+
+    fn shared_lock(&self) -> &SharedRwLock {
+        &GLOBAL_STYLE_DATA.shared_lock
     }
 }
 
@@ -561,6 +565,12 @@ impl<'le> GeckoElement<'le> {
     #[inline(always)]
     pub fn get_data(&self) -> Option<&AtomicRefCell<ElementData>> {
         unsafe { self.0.mServoData.get().as_ref() }
+    }
+
+    /// Returns whether any animation applies to this element.
+    #[inline]
+    pub fn has_any_animation(&self) -> bool {
+        self.may_have_animations() && unsafe { Gecko_ElementHasAnimations(self.0) }
     }
 
     #[inline(always)]
@@ -1231,11 +1241,17 @@ impl<'le> TElement for GeckoElement<'le> {
         }
     }
 
-    fn animation_rule(&self) -> Option<Arc<Locked<PropertyDeclarationBlock>>> {
+    fn animation_rule(
+        &self,
+        _: &SharedStyleContext,
+    ) -> Option<Arc<Locked<PropertyDeclarationBlock>>> {
         get_animation_rule(self, CascadeLevel::Animations)
     }
 
-    fn transition_rule(&self) -> Option<Arc<Locked<PropertyDeclarationBlock>>> {
+    fn transition_rule(
+        &self,
+        _: &SharedStyleContext,
+    ) -> Option<Arc<Locked<PropertyDeclarationBlock>>> {
         get_animation_rule(self, CascadeLevel::Transitions)
     }
 
@@ -1446,7 +1462,7 @@ impl<'le> TElement for GeckoElement<'le> {
     #[inline]
     fn may_have_animations(&self) -> bool {
         if let Some(pseudo) = self.implemented_pseudo_element() {
-            if !pseudo.is_before_or_after() {
+            if !pseudo.is_animatable() {
                 return false;
             }
             // FIXME(emilio): When would the parent of a ::before / ::after
@@ -1512,42 +1528,22 @@ impl<'le> TElement for GeckoElement<'le> {
         }
     }
 
-    fn has_animations(&self) -> bool {
-        self.may_have_animations() && unsafe { Gecko_ElementHasAnimations(self.0) }
+    #[inline]
+    fn has_animations(&self, _: &SharedStyleContext) -> bool {
+        self.has_any_animation()
     }
 
-    fn has_css_animations(&self) -> bool {
+    fn has_css_animations(&self, _: &SharedStyleContext, _: Option<PseudoElement>) -> bool {
         self.may_have_animations() && unsafe { Gecko_ElementHasCSSAnimations(self.0) }
     }
 
-    fn has_css_transitions(&self) -> bool {
+    fn has_css_transitions(&self, _: &SharedStyleContext, _: Option<PseudoElement>) -> bool {
         self.may_have_animations() && unsafe { Gecko_ElementHasCSSTransitions(self.0) }
     }
 
-    fn might_need_transitions_update(
-        &self,
-        old_style: Option<&ComputedValues>,
-        new_style: &ComputedValues,
-    ) -> bool {
-        let old_style = match old_style {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let new_box_style = new_style.get_box();
-        if !self.has_css_transitions() && !new_box_style.specifies_transitions() {
-            return false;
-        }
-
-        if new_box_style.clone_display().is_none() || old_style.clone_display().is_none() {
-            return false;
-        }
-
-        return true;
-    }
-
     // Detect if there are any changes that require us to update transitions.
-    // This is used as a more thoroughgoing check than the, cheaper
+    //
+    // This is used as a more thoroughgoing check than the cheaper
     // might_need_transitions_update check.
     //
     // The following logic shadows the logic used on the Gecko side
@@ -1561,12 +1557,6 @@ impl<'le> TElement for GeckoElement<'le> {
         after_change_style: &ComputedValues,
     ) -> bool {
         use crate::properties::LonghandIdSet;
-
-        debug_assert!(
-            self.might_need_transitions_update(Some(before_change_style), after_change_style),
-            "We should only call needs_transitions_update if \
-             might_need_transitions_update returns true"
-        );
 
         let after_change_box_style = after_change_style.get_box();
         let existing_transitions = self.css_transitions_info();
@@ -2037,8 +2027,8 @@ impl<'le> ::selectors::Element for GeckoElement<'le> {
             NonTSPseudoClass::MozHandlerCrashed |
             NonTSPseudoClass::Required |
             NonTSPseudoClass::Optional |
-            NonTSPseudoClass::MozReadOnly |
-            NonTSPseudoClass::MozReadWrite |
+            NonTSPseudoClass::ReadOnly |
+            NonTSPseudoClass::ReadWrite |
             NonTSPseudoClass::FocusWithin |
             NonTSPseudoClass::FocusVisible |
             NonTSPseudoClass::MozDragOver |
@@ -2062,6 +2052,7 @@ impl<'le> ::selectors::Element for GeckoElement<'le> {
             NonTSPseudoClass::MozDirAttrRTL |
             NonTSPseudoClass::MozDirAttrLikeAuto |
             NonTSPseudoClass::MozAutofill |
+            NonTSPseudoClass::MozModalDialog |
             NonTSPseudoClass::Active |
             NonTSPseudoClass::Hover |
             NonTSPseudoClass::MozAutofillPreview => {
